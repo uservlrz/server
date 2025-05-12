@@ -1,3 +1,4 @@
+// index.js - versão otimizada para Vercel
 const express = require('express');
 const multer = require('multer');
 const cors = require('cors');
@@ -15,14 +16,42 @@ const PORT = process.env.PORT || 5000;
 app.use(cors());
 app.use(express.json());
 
+// Verificar se API Key existe
+if (!process.env.OPENAI_API_KEY) {
+  console.error('ERRO: Chave da API da OpenAI não encontrada! Verifique as variáveis de ambiente.');
+}
+
 // Configurar OpenAI
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
+// Verificar ambiente Vercel
+const isVercel = process.env.VERCEL || false;
+const uploadDir = isVercel ? '/tmp' : 'uploads';
+
+// Criar diretório de uploads apenas para desenvolvimento local
+try {
+  if (!isVercel && !fs.existsSync(uploadDir)) {
+    fs.mkdirSync(uploadDir, { recursive: true });
+    console.log(`Diretório de uploads criado: ${uploadDir}`);
+  }
+} catch (err) {
+  console.error(`Erro ao criar diretório de uploads: ${err.message}`);
+}
+
 // Configuração do Multer para upload de arquivos
+const storage = multer.diskStorage({
+  destination: function (req, file, cb) {
+    cb(null, uploadDir);
+  },
+  filename: function (req, file, cb) {
+    cb(null, Date.now() + '-' + file.originalname);
+  }
+});
+
 const upload = multer({ 
-  dest: 'uploads/',
+  storage: storage,
   fileFilter: (req, file, cb) => {
     if (file.mimetype === 'application/pdf') {
       cb(null, true);
@@ -272,6 +301,11 @@ function removeDuplicates(content) {
   return `${patientLine}\n\n${uniqueLines.join('\n')}`;
 }
 
+// Rota para verificar se o servidor está funcionando
+app.get('/api/health', (req, res) => {
+  res.json({ status: 'ok', env: isVercel ? 'vercel' : 'local' });
+});
+
 // Rota para o upload do PDF
 app.post('/api/upload', upload.single('pdf'), async (req, res) => {
   try {
@@ -279,8 +313,12 @@ app.post('/api/upload', upload.single('pdf'), async (req, res) => {
       return res.status(400).json({ message: 'Nenhum arquivo foi enviado' });
     }
 
-    const filePath = path.join(__dirname, req.file.path);
+    // Caminho do arquivo simplificado
+    const filePath = req.file.path;
+    console.log(`Arquivo recebido: ${filePath}`);
+    
     const pdfBuffer = fs.readFileSync(filePath);
+    console.log(`Arquivo lido com sucesso, tamanho: ${pdfBuffer.length} bytes`);
     
     let patientName = '';
     let pdfParts = [];
@@ -341,13 +379,14 @@ app.post('/api/upload', upload.single('pdf'), async (req, res) => {
     try {
       // Limpar arquivo temporário
       fs.unlinkSync(filePath);
+      console.log(`Arquivo temporário removido: ${filePath}`);
     } catch (unlinkError) {
       console.error('Erro ao remover arquivo temporário:', unlinkError);
     }
 
     res.json({ 
       summaries: allSummaries,
-      patientName: patientName, // Adicionando o nome do paciente na resposta da API
+      patientName: patientName,
       extractionMethod: extractionMethod
     });
   } catch (error) {
@@ -359,6 +398,12 @@ app.post('/api/upload', upload.single('pdf'), async (req, res) => {
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`Servidor rodando na porta ${PORT}`);
-});
+// Iniciar o servidor apenas em ambiente local
+if (!isVercel) {
+  app.listen(PORT, () => {
+    console.log(`Servidor rodando na porta ${PORT}`);
+  });
+}
+
+// Exportar o app para o Vercel
+module.exports = app;
