@@ -1,4 +1,4 @@
-// index.js - versão otimizada para Vercel
+// index.js - Servidor Node.js otimizado para ambiente local e Vercel
 const express = require('express');
 const multer = require('multer');
 const cors = require('cors');
@@ -12,8 +12,20 @@ require('dotenv').config();
 const app = express();
 const PORT = process.env.PORT || 5000;
 
+// Verificar ambiente
+const isVercel = process.env.VERCEL === '1';
+console.log(`Ambiente: ${isVercel ? 'Vercel' : 'Local'}`);
+
+// Configuração CORS melhorada para permitir acesso do frontend
+app.use(cors({
+  origin: '*', // Permite qualquer origem - ajuste para produção se necessário
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  credentials: true,
+  maxAge: 86400 // 24 horas em segundos
+}));
+
 // Middleware
-app.use(cors());
 app.use(express.json());
 
 // Verificar se API Key existe
@@ -26,8 +38,7 @@ const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
-// Verificar ambiente Vercel
-const isVercel = process.env.VERCEL || false;
+// Configurar diretório de uploads
 const uploadDir = isVercel ? '/tmp' : 'uploads';
 
 // Criar diretório de uploads apenas para desenvolvimento local
@@ -301,9 +312,96 @@ function removeDuplicates(content) {
   return `${patientLine}\n\n${uniqueLines.join('\n')}`;
 }
 
-// Rota para verificar se o servidor está funcionando
+// Rota para a página inicial
+app.get('/', (req, res) => {
+  res.send(`
+    <!DOCTYPE html>
+    <html lang="pt-br">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>API de Processamento de Exames</title>
+        <style>
+            body {
+                font-family: Arial, sans-serif;
+                line-height: 1.6;
+                margin: 0;
+                padding: 20px;
+                color: #333;
+                max-width: 800px;
+                margin: 0 auto;
+            }
+            h1 {
+                color: #2c3e50;
+                border-bottom: 2px solid #3498db;
+                padding-bottom: 10px;
+            }
+            h2 {
+                color: #2980b9;
+            }
+            .endpoint {
+                background-color: #f8f9fa;
+                border-left: 4px solid #3498db;
+                padding: 10px 15px;
+                margin: 15px 0;
+            }
+            .method {
+                font-weight: bold;
+                color: #e74c3c;
+            }
+            .path {
+                font-family: monospace;
+                background-color: #eee;
+                padding: 2px 5px;
+                border-radius: 3px;
+            }
+            .description {
+                margin-top: 5px;
+            }
+            footer {
+                margin-top: 30px;
+                border-top: 1px solid #eee;
+                padding-top: 10px;
+                font-size: 0.8em;
+                color: #7f8c8d;
+            }
+        </style>
+    </head>
+    <body>
+        <h1>API de Processamento de Exames</h1>
+        <p>Esta é a API do sistema de processamento de laudos laboratoriais. Esta API fornece endpoints para processar arquivos PDF de exames médicos e extrair informações relevantes.</p>
+        
+        <h2>Endpoints Disponíveis</h2>
+        
+        <div class="endpoint">
+            <div><span class="method">GET</span> <span class="path">/api/health</span></div>
+            <div class="description">Verifica se a API está funcionando corretamente.</div>
+        </div>
+        
+        <div class="endpoint">
+            <div><span class="method">POST</span> <span class="path">/api/upload</span></div>
+            <div class="description">Recebe um arquivo PDF de exames médicos e retorna um resumo estruturado dos dados extraídos.</div>
+        </div>
+        
+        <h2>Como Usar</h2>
+        <p>Esta API deve ser consumida pelo frontend da aplicação. Não é destinada para uso direto no navegador.</p>
+        
+        <footer>
+            &copy; 2025 Instituto Paulo Godoi - API de Processamento de Exames
+            <p>Ambiente: ${isVercel ? 'Vercel (Produção)' : 'Local (Desenvolvimento)'}</p>
+        </footer>
+    </body>
+    </html>
+  `);
+});
+
+// Rota para verificação de saúde da API
 app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', env: isVercel ? 'vercel' : 'local' });
+  res.json({ 
+    status: 'ok', 
+    env: isVercel ? 'vercel' : 'local',
+    timestamp: new Date().toISOString()
+  });
 });
 
 // Rota para o upload do PDF
@@ -402,6 +500,8 @@ app.post('/api/upload', upload.single('pdf'), async (req, res) => {
 if (!isVercel) {
   app.listen(PORT, () => {
     console.log(`Servidor rodando na porta ${PORT}`);
+    console.log(`Acesse: http://localhost:${PORT}`);
+    console.log(`Verificação de saúde: http://localhost:${PORT}/api/health`);
   });
 }
 
