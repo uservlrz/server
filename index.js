@@ -1,19 +1,23 @@
-// index.js - Servidor Node.js otimizado para ambiente local e Vercel
+// index.js - Servidor Node.js otimizado para Vercel e ambiente local
 const express = require('express');
 const multer = require('multer');
 const cors = require('cors');
 const path = require('path');
 const fs = require('fs');
-const pdfParse = require('pdf-parse');
 const { OpenAI } = require('openai');
-const { PDFDocument } = require('pdf-lib');
 require('dotenv').config();
+
+// Importar utilitários de processamento de PDF
+const { parsePdf } = require('./utils/pdfParser');
+const { validatePdf, repairPdf } = require('./utils/pdfValidator');
+const { isPdfEncrypted, attemptPdfDecryption, isVercelEnvironment } = require('./utils/pdfDecryptor');
+const { splitPDF, cleanupTempFiles } = require('./utils/pdfSplitter');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 
 // Verificar ambiente
-const isVercel = process.env.VERCEL === '1';
+const isVercel = isVercelEnvironment();
 console.log(`Ambiente: ${isVercel ? 'Vercel' : 'Local'}`);
 
 // Configuração CORS melhorada para permitir acesso do frontend
@@ -69,91 +73,21 @@ const upload = multer({
     } else {
       cb(new Error('Apenas arquivos PDF são permitidos'), false);
     }
+  },
+  limits: {
+    fileSize: 50 * 1024 * 1024 // Limite de 50MB
   }
 });
-
-// Função para dividir o PDF em partes menores (a cada 10 páginas)
-async function splitPDF(pdfBuffer) {
-  try {
-    // Carregar o PDF original - adicionando opção para ignorar criptografia
-    const originalPdfDoc = await PDFDocument.load(pdfBuffer, { 
-      ignoreEncryption: true 
-    });
-    const pageCount = originalPdfDoc.getPageCount();
-    
-    // Determinar quantas partes teremos
-    const PAGES_PER_PART = 10;
-    const numberOfParts = Math.ceil(pageCount / PAGES_PER_PART);
-    
-    // Array para armazenar as partes do PDF
-    const pdfParts = [];
-    
-    // Dividir o PDF em partes menores
-    for (let i = 0; i < numberOfParts; i++) {
-      // Criar um novo documento PDF
-      const newPdfDoc = await PDFDocument.create();
-      
-      // Determinar as páginas para esta parte
-      const startPage = i * PAGES_PER_PART;
-      const endPage = Math.min((i + 1) * PAGES_PER_PART, pageCount);
-      
-      // Copiar as páginas do PDF original
-      const pagesToCopy = originalPdfDoc.getPages().slice(startPage, endPage);
-      const copiedPages = await newPdfDoc.copyPages(originalPdfDoc, pagesToCopy.map((_, index) => startPage + index));
-      
-      // Adicionar as páginas copiadas ao novo documento
-      copiedPages.forEach(page => {
-        newPdfDoc.addPage(page);
-      });
-      
-      // Salvar esta parte como um buffer
-      const pdfBytes = await newPdfDoc.save();
-      pdfParts.push(Buffer.from(pdfBytes));
-      
-      console.log(`Parte ${i+1}/${numberOfParts} criada (páginas ${startPage+1}-${endPage})`);
-    }
-    
-    return pdfParts;
-  } catch (error) {
-    console.error('Erro ao dividir o PDF:', error);
-    
-    // Se ocorrer erro na divisão, retornaremos o PDF original como uma única parte
-    console.log('Tentando processar o PDF original sem dividir...');
-    return [pdfBuffer];
-  }
-}
-
-// Função para extrair texto do PDF
-async function parsePdf(pdfBuffer) {
-  try {
-    // Opções adicionais para lidar com PDFs criptografados na biblioteca pdf-parse
-    const options = {};
-    
-    const data = await pdfParse(pdfBuffer, options);
-    
-    // Retornar apenas o texto de cada parte do PDF
-    return [{ 
-      page: 'Resultados', 
-      text: data.text 
-    }];
-  } catch (error) {
-    console.error('Erro ao analisar o PDF:', error);
-    
-    // Se houver erro na análise do PDF, tente um método alternativo
-    // ou retorne um objeto vazio para evitar quebrar o fluxo
-    console.log('Utilizando método alternativo para extrair texto...');
-    return [{ 
-      page: 'Resultados', 
-      text: 'Não foi possível extrair o texto do PDF. É possível que o documento esteja protegido.' 
-    }];
-  }
-}
 
 // Função para extrair o nome do paciente do PDF
 async function extractPatientName(pages) {
   try {
+    // Se não temos páginas ou texto, retornar valor padrão
+    if (!pages || !pages.length || !pages[0].text) {
+      return 'Nome do Paciente não identificado';
+    }
+    
     // Pegamos apenas o início do documento para encontrar o nome do paciente
-    // Normalmente, essas informações estão nas primeiras páginas
     const initialText = pages[0].text.slice(0, 3000);
     
     // Primeiro, tenta extrair o nome usando expressões regulares (mais rápido e econômico)
@@ -234,16 +168,19 @@ async function generateSummaries(pages, patientName) {
 - Valor de referência (apenas os números, sem texto adicional)
 
 Formato exato para resultados únicos:
-"Nome do Exame: Resultado Unidade | Referência: Valor mínimo - Valor máximo"
+"Nome do Exame: Resultado Unidade | VR: Valor mínimo - Valor máximo"
 
 Formato exato para resultados duplos (percentual e absoluto):
-"Nome do Exame: Resultado1 % / Resultado2 Unidade | Referência: Valor mínimo - Valor máximo"
+"Nome do Exame: Resultado1 % / Resultado2 Unidade | VR: Valor mínimo - Valor máximo"
 
 IMPORTANTE:
 - NÃO adicione texto explicativo, notas ou métodos
 - NÃO adicione informações específicas para gestantes, idosos, etc.
 - APENAS extraia os valores principais conforme o formato acima
 - Mantenha apenas o valor final de referência, sem explicações adicionais
+- Quando o valor do resultado estiver alterado (maior ou menor que o valor de referencia), colocar 3 asteriscos no nome
+- SEMPRE EXTRAIA TODOS OS RESULTADOS DO HEMOGRAMA COMPLETO
+- SEMPRE EXTRAIA TODOS OS RESULTADOS DO ERITROGRAMA E LEUCOGRAMA
 
 
 Texto para análise:
@@ -404,7 +341,8 @@ app.get('/api/health', (req, res) => {
   });
 });
 
-// Rota para o upload do PDF
+// Rota para o upload do PDF com tratamento para PDFs problemáticos
+// Usando apenas bibliotecas compatíveis com Vercel
 app.post('/api/upload', upload.single('pdf'), async (req, res) => {
   try {
     if (!req.file) {
@@ -415,78 +353,182 @@ app.post('/api/upload', upload.single('pdf'), async (req, res) => {
     const filePath = req.file.path;
     console.log(`Arquivo recebido: ${filePath}`);
     
-    const pdfBuffer = fs.readFileSync(filePath);
-    console.log(`Arquivo lido com sucesso, tamanho: ${pdfBuffer.length} bytes`);
-    
-    let patientName = '';
-    let pdfParts = [];
+    // Lista para armazenar caminhos de arquivos temporários para limpeza
+    let tempFiles = [];
+    let patientName = 'Nome do Paciente não identificado';
     let extractionMethod = 'normal';
+    let errorDetails = null;
     
     try {
-      // Tentar dividir o PDF em partes menores (a cada 10 páginas)
-      console.log("Dividindo o PDF em partes menores...");
-      pdfParts = await splitPDF(pdfBuffer);
-      console.log(`PDF dividido em ${pdfParts.length} partes.`);
-    } catch (splitError) {
-      console.error('Erro na divisão do PDF. Tentando processar o arquivo inteiro:', splitError);
-      pdfParts = [pdfBuffer]; // Usar o PDF original como uma única parte
-      extractionMethod = 'alternativo';
-    }
-    
-    try {
+      // Ler o arquivo PDF
+      const pdfBuffer = fs.readFileSync(filePath);
+      console.log(`Arquivo lido com sucesso, tamanho: ${pdfBuffer.length} bytes`);
+      
+      // Passo 1: Validar o PDF
+      console.log("Validando o PDF...");
+      const validationResult = await validatePdf(filePath);
+      console.log("Resultado da validação:", validationResult.message);
+      
+      // Passo 2: Verificar se o PDF está criptografado
+      const isEncrypted = await isPdfEncrypted(filePath);
+      console.log(`PDF está criptografado? ${isEncrypted ? 'Sim' : 'Não'}`);
+      
+      // Array para armazenar os resultados das tentativas
+      let processingResults = [];
+      let pdfParts = null;
+      
+      // Processando o PDF de acordo com suas características
+      if (isEncrypted) {
+        // Se o PDF estiver criptografado, tentar remover a proteção
+        console.log("PDF está criptografado, tentando remover proteção...");
+        const decryptResult = await attemptPdfDecryption(filePath);
+        
+        if (decryptResult.success) {
+          console.log("Proteção removida com sucesso, processando PDF desprotegido...");
+          tempFiles.push(decryptResult.decryptedPath);
+          extractionMethod = 'desprotegido';
+          
+          // Usar o arquivo desprotegido para os próximos passos
+          const decryptedBuffer = fs.readFileSync(decryptResult.decryptedPath);
+          pdfParts = await splitPDF(decryptedBuffer);
+        } else {
+          console.log("Não foi possível remover a proteção, tentando reparar...");
+          processingResults.push({
+            method: 'desproteger',
+            success: false,
+            error: decryptResult.error
+          });
+          
+          // Tentar reparar o PDF
+          const repairResult = await repairPdf(filePath);
+          
+          if (repairResult.success) {
+            console.log("PDF reparado com sucesso, processando...");
+            tempFiles.push(repairResult.repairedPath);
+            extractionMethod = 'reparado';
+            
+            // Usar o arquivo reparado para os próximos passos
+            const repairedBuffer = fs.readFileSync(repairResult.repairedPath);
+            pdfParts = await splitPDF(repairedBuffer);
+          } else {
+            // Se não conseguimos desproteger nem reparar, tentar com o arquivo original
+            console.log("Não foi possível reparar, tentando processar o arquivo original...");
+            pdfParts = await splitPDF(pdfBuffer);
+          }
+        }
+      } else {
+        // Se o PDF não está criptografado, dividir em partes normalmente
+        console.log("Dividindo o PDF em partes menores...");
+        pdfParts = await splitPDF(pdfBuffer);
+      }
+      
+      // Se não conseguimos dividir o PDF, usar o arquivo original como uma única parte
+      if (!pdfParts || pdfParts.length === 0) {
+        console.log("Falha ao dividir o PDF, usando como parte única");
+        pdfParts = [pdfBuffer];
+        extractionMethod = 'falha_divisao';
+      } else {
+        console.log(`PDF dividido em ${pdfParts.length} partes`);
+      }
+      
       // Extrair texto da primeira parte para obter o nome do paciente
       console.log("Extraindo informações do paciente...");
       const initialPages = await parsePdf(pdfParts[0]);
       patientName = await extractPatientName(initialPages);
       console.log(`Nome do paciente identificado: ${patientName}`);
-    } catch (nameError) {
-      console.error('Erro ao extrair o nome do paciente:', nameError);
-      patientName = 'Nome do Paciente não identificado';
-    }
-    
-    const allSummaries = [];
-    
-    // Processar cada parte do PDF
-    for (let i = 0; i < pdfParts.length; i++) {
-      try {
-        console.log(`Processando parte ${i+1}/${pdfParts.length}...`);
-        const partBuffer = pdfParts[i];
-        
-        // Extrair texto desta parte
-        const pages = await parsePdf(partBuffer);
-        
-        // Gerar resumos para esta parte, incluindo o nome do paciente
-        const summaries = await generateSummaries(pages, patientName);
-        
-        // Adicionar os resumos ao array geral
-        allSummaries.push(...summaries);
-      } catch (partError) {
-        console.error(`Erro ao processar a parte ${i+1}:`, partError);
-        allSummaries.push({
-          page: `Parte ${i+1}`,
-          content: `Paciente: ${patientName}\n\nErro ao processar esta parte do documento.`
-        });
+      
+      const allSummaries = [];
+      
+      // Processar cada parte do PDF
+      for (let i = 0; i < pdfParts.length; i++) {
+        try {
+          console.log(`Processando parte ${i+1}/${pdfParts.length}...`);
+          const partBuffer = pdfParts[i];
+          
+          // Extrair texto desta parte
+          const pages = await parsePdf(partBuffer);
+          
+          // Gerar resumos para esta parte, incluindo o nome do paciente
+          const summaries = await generateSummaries(pages, patientName);
+          
+          // Adicionar os resumos ao array geral
+          allSummaries.push(...summaries);
+        } catch (partError) {
+          console.error(`Erro ao processar a parte ${i+1}:`, partError);
+          allSummaries.push({
+            page: `Parte ${i+1}`,
+            content: `Paciente: ${patientName}\n\nErro ao processar esta parte do documento.`
+          });
+        }
       }
+      
+      // Processar os resultados para remover duplicatas
+      for (let i = 0; i < allSummaries.length; i++) {
+        allSummaries[i].content = removeDuplicates(allSummaries[i].content);
+      }
+      
+      // Limpar arquivos temporários
+      console.log("Limpando arquivos temporários...");
+      tempFiles.forEach(tempFile => {
+        try {
+          if (fs.existsSync(tempFile)) {
+            fs.unlinkSync(tempFile);
+            console.log(`Arquivo temporário removido: ${tempFile}`);
+          }
+        } catch (cleanupError) {
+          console.error(`Erro ao remover arquivo temporário ${tempFile}:`, cleanupError);
+        }
+      });
+      
+      // Limpar arquivo original
+      try {
+        if (fs.existsSync(filePath)) {
+          fs.unlinkSync(filePath);
+          console.log(`Arquivo original removido: ${filePath}`);
+        }
+      } catch (unlinkError) {
+        console.error(`Erro ao remover arquivo original ${filePath}:`, unlinkError);
+      }
+      
+      // Retornar resultados
+      res.json({ 
+        summaries: allSummaries,
+        patientName: patientName,
+        extractionMethod: extractionMethod,
+        processingDetails: processingResults.length > 0 ? processingResults : undefined
+      });
+      
+    } catch (processingError) {
+      console.error("Erro global de processamento:", processingError);
+      
+      // Limpar arquivos temporários em caso de erro
+      tempFiles.forEach(tempFile => {
+        try {
+          if (fs.existsSync(tempFile)) {
+            fs.unlinkSync(tempFile);
+            console.log(`Arquivo temporário removido: ${tempFile}`);
+          }
+        } catch (cleanupError) {
+          console.error(`Erro ao remover arquivo temporário ${tempFile}:`, cleanupError);
+        }
+      });
+      
+      // Limpar arquivo original
+      try {
+        if (fs.existsSync(filePath)) {
+          fs.unlinkSync(filePath);
+          console.log(`Arquivo original removido: ${filePath}`);
+        }
+      } catch (unlinkError) {
+        console.error(`Erro ao remover arquivo original ${filePath}:`, unlinkError);
+      }
+      
+      // Retornar erro
+      res.status(500).json({ 
+        message: 'Erro ao processar o documento: ' + processingError.message,
+        error: processingError.toString()
+      });
     }
-    
-    // Processar os resultados para remover duplicatas
-    for (let i = 0; i < allSummaries.length; i++) {
-      allSummaries[i].content = removeDuplicates(allSummaries[i].content);
-    }
-    
-    try {
-      // Limpar arquivo temporário
-      fs.unlinkSync(filePath);
-      console.log(`Arquivo temporário removido: ${filePath}`);
-    } catch (unlinkError) {
-      console.error('Erro ao remover arquivo temporário:', unlinkError);
-    }
-
-    res.json({ 
-      summaries: allSummaries,
-      patientName: patientName,
-      extractionMethod: extractionMethod
-    });
   } catch (error) {
     console.error('Erro ao processar o PDF:', error);
     res.status(500).json({ 
