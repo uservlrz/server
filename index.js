@@ -12,6 +12,8 @@ const { parsePdf } = require('./utils/pdfParser');
 const { validatePdf, repairPdf } = require('./utils/pdfValidator');
 const { isPdfEncrypted, attemptPdfDecryption, isVercelEnvironment } = require('./utils/pdfDecryptor');
 const { splitPDF, cleanupTempFiles } = require('./utils/pdfSplitter');
+// ADIÇÃO: Importar o serviço OCR
+const { processOcr } = require('./utils/ocrService');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -32,9 +34,13 @@ app.use(cors({
 // Middleware
 app.use(express.json());
 
-// Verificar se API Key existe
+// Verificar se API Keys existem
 if (!process.env.OPENAI_API_KEY) {
   console.error('ERRO: Chave da API da OpenAI não encontrada! Verifique as variáveis de ambiente.');
+}
+// ADIÇÃO: Verificar API key do OCR
+if (!process.env.OCR_API_KEY || process.env.OCR_API_KEY === 'helloworld') {
+  console.warn('AVISO: Usando chave de API OCR padrão. Obtenha uma chave em ocr.space para melhor funcionamento.');
 }
 
 // Configurar OpenAI
@@ -165,7 +171,7 @@ async function generateSummaries(pages, patientName) {
         const prompt = `Analise o seguinte texto de um documento de exames laboratoriais e extraia APENAS:
 - Nome do exame
 - Resultado numérico SEM UNIDADE
-- Valor de referência (apenas os números, sem texto adicional)
+- Valor de referência (apenas os números, sem texto adicional OU MESMO UNIDADES DE MEDIDA)
 
 Formato exato para resultados únicos:
 "Nome do Exame: Resultado Unidade | VR: Valor mínimo - Valor máximo"
@@ -174,13 +180,15 @@ Formato exato para resultados duplos (percentual e absoluto):
 "Nome do Exame: Resultado1 % / Resultado2 Unidade | VR: Valor mínimo - Valor máximo"
 
 IMPORTANTE:
+- NUNCA adicione unidades de medida
+- Nunca arredonde casas decimais, sempre extraia o valor bruto
+- Extraia as informações de TODAS as paginas, sem excessões
 - NÃO adicione texto explicativo, notas ou métodos
 - NÃO adicione informações específicas para gestantes, idosos, etc.
 - APENAS extraia os valores principais conforme o formato acima
 - Mantenha apenas o valor final de referência, sem explicações adicionais
-- Quando o valor do resultado estiver alterado (maior ou menor que o valor de referencia), colocar 3 asteriscos no nome
-- SEMPRE EXTRAIA TODOS OS RESULTADOS DO HEMOGRAMA COMPLETO
-- SEMPRE EXTRAIA TODOS OS RESULTADOS DO ERITROGRAMA E LEUCOGRAMA
+- Colocar tres asteriscos apos resultado quando os valores estiverem fora do valor de referencia (VR), ou seja, alterados
+
 
 
 Texto para análise:
@@ -376,9 +384,86 @@ app.post('/api/upload', upload.single('pdf'), async (req, res) => {
       // Array para armazenar os resultados das tentativas
       let processingResults = [];
       let pdfParts = null;
+      let finalText = null;
+      
+      // ADIÇÃO: Tentar OCR primeiro se o PDF estiver criptografado
+      if (isEncrypted) {
+        try {
+          console.log("Tentativa OCR: Processando PDF protegido via API OCR...");
+          
+          // Executar OCR usando API externa
+          const ocrResults = await processOcr(filePath);
+          
+          if (ocrResults && ocrResults.length > 0 && ocrResults[0].text) {
+            console.log("OCR via API bem-sucedido!");
+            finalText = ocrResults;
+            extractionMethod = 'ocr_api';
+            
+            // Extrair nome do paciente do texto OCR
+            patientName = await extractPatientName(ocrResults);
+            console.log(`Nome do paciente identificado via OCR: ${patientName}`);
+            
+            // Preparar os resumos
+            const summaries = await generateSummaries(finalText, patientName);
+            
+            // Processar os resultados para remover duplicatas
+            const processedSummaries = summaries.map(summary => ({
+              ...summary,
+              content: removeDuplicates(summary.content)
+            }));
+            
+            // Limpar arquivos temporários
+            console.log("Limpando arquivos temporários...");
+            tempFiles.forEach(tempFile => {
+              try {
+                if (fs.existsSync(tempFile)) {
+                  fs.unlinkSync(tempFile);
+                  console.log(`Arquivo temporário removido: ${tempFile}`);
+                }
+              } catch (cleanupError) {
+                console.error(`Erro ao remover arquivo temporário ${tempFile}:`, cleanupError);
+              }
+            });
+            
+            // Limpar arquivo original
+            try {
+              if (fs.existsSync(filePath)) {
+                fs.unlinkSync(filePath);
+                console.log(`Arquivo original removido: ${filePath}`);
+              }
+            } catch (unlinkError) {
+              console.error(`Erro ao remover arquivo original ${filePath}:`, unlinkError);
+            }
+            
+            // Retornar resultados do OCR
+            return res.json({ 
+              summaries: processedSummaries,
+              patientName: patientName,
+              extractionMethod: extractionMethod,
+              processingDetails: processingResults.length > 0 ? processingResults : undefined
+            });
+          } else {
+            console.log("OCR via API não retornou texto utilizável, tentando outros métodos");
+            processingResults.push({
+              method: 'ocr_api',
+              success: false,
+              error: 'Sem texto reconhecido'
+            });
+          }
+        } catch (ocrError) {
+          console.error("Erro no processamento OCR via API:", ocrError);
+          processingResults.push({
+            method: 'ocr_api',
+            success: false,
+            error: ocrError.message
+          });
+        }
+      }
+      
+      // Se OCR falhou ou não foi utilizado, continuar com fluxo normal
       
       // Processando o PDF de acordo com suas características
-      if (isEncrypted) {
+      if (isEncrypted && !finalText) {
         // Se o PDF estiver criptografado, tentar remover a proteção
         console.log("PDF está criptografado, tentando remover proteção...");
         const decryptResult = await attemptPdfDecryption(filePath);
@@ -416,88 +501,92 @@ app.post('/api/upload', upload.single('pdf'), async (req, res) => {
             pdfParts = await splitPDF(pdfBuffer);
           }
         }
-      } else {
+      } else if (!isEncrypted) {
         // Se o PDF não está criptografado, dividir em partes normalmente
         console.log("Dividindo o PDF em partes menores...");
         pdfParts = await splitPDF(pdfBuffer);
       }
       
-      // Se não conseguimos dividir o PDF, usar o arquivo original como uma única parte
-      if (!pdfParts || pdfParts.length === 0) {
-        console.log("Falha ao dividir o PDF, usando como parte única");
-        pdfParts = [pdfBuffer];
-        extractionMethod = 'falha_divisao';
-      } else {
-        console.log(`PDF dividido em ${pdfParts.length} partes`);
-      }
-      
-      // Extrair texto da primeira parte para obter o nome do paciente
-      console.log("Extraindo informações do paciente...");
-      const initialPages = await parsePdf(pdfParts[0]);
-      patientName = await extractPatientName(initialPages);
-      console.log(`Nome do paciente identificado: ${patientName}`);
-      
-      const allSummaries = [];
-      
-      // Processar cada parte do PDF
-      for (let i = 0; i < pdfParts.length; i++) {
-        try {
-          console.log(`Processando parte ${i+1}/${pdfParts.length}...`);
-          const partBuffer = pdfParts[i];
-          
-          // Extrair texto desta parte
-          const pages = await parsePdf(partBuffer);
-          
-          // Gerar resumos para esta parte, incluindo o nome do paciente
-          const summaries = await generateSummaries(pages, patientName);
-          
-          // Adicionar os resumos ao array geral
-          allSummaries.push(...summaries);
-        } catch (partError) {
-          console.error(`Erro ao processar a parte ${i+1}:`, partError);
-          allSummaries.push({
-            page: `Parte ${i+1}`,
-            content: `Paciente: ${patientName}\n\nErro ao processar esta parte do documento.`
-          });
-        }
-      }
-      
-      // Processar os resultados para remover duplicatas
-      for (let i = 0; i < allSummaries.length; i++) {
-        allSummaries[i].content = removeDuplicates(allSummaries[i].content);
-      }
-      
-      // Limpar arquivos temporários
-      console.log("Limpando arquivos temporários...");
-      tempFiles.forEach(tempFile => {
-        try {
-          if (fs.existsSync(tempFile)) {
-            fs.unlinkSync(tempFile);
-            console.log(`Arquivo temporário removido: ${tempFile}`);
+      // Se ainda não temos um resultado final do OCR, continuamos o processamento normal
+      if (!finalText) {
+        // Se não conseguimos dividir o PDF, usar o arquivo original como uma única parte
+        if (!pdfParts || pdfParts.length === 0) {
+          console.log("Falha ao dividir o PDF, usando como parte única");
+          pdfParts = [pdfBuffer];
+          if (extractionMethod === 'normal') {
+            extractionMethod = 'falha_divisao';
           }
-        } catch (cleanupError) {
-          console.error(`Erro ao remover arquivo temporário ${tempFile}:`, cleanupError);
+        } else {
+          console.log(`PDF dividido em ${pdfParts.length} partes`);
         }
-      });
-      
-      // Limpar arquivo original
-      try {
-        if (fs.existsSync(filePath)) {
-          fs.unlinkSync(filePath);
-          console.log(`Arquivo original removido: ${filePath}`);
+        
+        // Extrair texto da primeira parte para obter o nome do paciente
+        console.log("Extraindo informações do paciente...");
+        const initialPages = await parsePdf(pdfParts[0]);
+        patientName = await extractPatientName(initialPages);
+        console.log(`Nome do paciente identificado: ${patientName}`);
+        
+        const allSummaries = [];
+        
+        // Processar cada parte do PDF
+        for (let i = 0; i < pdfParts.length; i++) {
+          try {
+            console.log(`Processando parte ${i+1}/${pdfParts.length}...`);
+            const partBuffer = pdfParts[i];
+            
+            // Extrair texto desta parte
+            const pages = await parsePdf(partBuffer);
+            
+            // Gerar resumos para esta parte, incluindo o nome do paciente
+            const summaries = await generateSummaries(pages, patientName);
+            
+            // Adicionar os resumos ao array geral
+            allSummaries.push(...summaries);
+          } catch (partError) {
+            console.error(`Erro ao processar a parte ${i+1}:`, partError);
+            allSummaries.push({
+              page: `Parte ${i+1}`,
+              content: `Paciente: ${patientName}\n\nErro ao processar esta parte do documento.`
+            });
+          }
         }
-      } catch (unlinkError) {
-        console.error(`Erro ao remover arquivo original ${filePath}:`, unlinkError);
+        
+        // Processar os resultados para remover duplicatas
+        for (let i = 0; i < allSummaries.length; i++) {
+          allSummaries[i].content = removeDuplicates(allSummaries[i].content);
+        }
+        
+        // Limpar arquivos temporários
+        console.log("Limpando arquivos temporários...");
+        tempFiles.forEach(tempFile => {
+          try {
+            if (fs.existsSync(tempFile)) {
+              fs.unlinkSync(tempFile);
+              console.log(`Arquivo temporário removido: ${tempFile}`);
+            }
+          } catch (cleanupError) {
+            console.error(`Erro ao remover arquivo temporário ${tempFile}:`, cleanupError);
+          }
+        });
+        
+        // Limpar arquivo original
+        try {
+          if (fs.existsSync(filePath)) {
+            fs.unlinkSync(filePath);
+            console.log(`Arquivo original removido: ${filePath}`);
+          }
+        } catch (unlinkError) {
+          console.error(`Erro ao remover arquivo original ${filePath}:`, unlinkError);
+        }
+        
+        // Retornar resultados
+        res.json({ 
+          summaries: allSummaries,
+          patientName: patientName,
+          extractionMethod: extractionMethod,
+          processingDetails: processingResults.length > 0 ? processingResults : undefined
+        });
       }
-      
-      // Retornar resultados
-      res.json({ 
-        summaries: allSummaries,
-        patientName: patientName,
-        extractionMethod: extractionMethod,
-        processingDetails: processingResults.length > 0 ? processingResults : undefined
-      });
-      
     } catch (processingError) {
       console.error("Erro global de processamento:", processingError);
       

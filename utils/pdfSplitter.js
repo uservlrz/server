@@ -8,7 +8,7 @@ const { PDFDocument } = require('pdf-lib');
  * @param {number} pagesPerPart - Número de páginas por parte (padrão: 5)
  * @returns {Promise<Array<Buffer>>} - Array de buffers, um para cada parte do PDF
  */
-async function splitPDF(pdfBuffer, pagesPerPart = 5) {
+async function splitPDF(pdfBuffer, pagesPerPart = 1) {
   try {
     console.log(`Tentando dividir o PDF em partes de ${pagesPerPart} páginas...`);
     
