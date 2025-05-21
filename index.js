@@ -230,7 +230,7 @@ async function extractPatientName(pages, filePath) {
   }
 }
 
-// Função para gerar resumos com GPT-3.5
+// Função para gerar resumos com GPT-3.5 - versão simplificada mantendo a ordem original
 async function generateSummaries(pages, patientName) {
   const summaries = [];
 
@@ -245,38 +245,57 @@ async function generateSummaries(pages, patientName) {
     return chunks;
   }
 
+  // Manter um registro global dos exames já extraídos entre todas as páginas
+  const seenExams = new Set();
+  let allResults = [];
+
   for (const page of pages) {
     try {
       const textChunks = splitTextIntoChunks(page.text);
-      let pageResumo = `Paciente: ${patientName}\n\n`;
+      let pageResults = [];
       
       for (const chunk of textChunks) {
         // Prompt específico para extrair apenas referências numéricas com valores
-        const prompt = `Analise o seguinte texto de um documento de exames laboratoriais e extraia APENAS:
-- Nome do exame
-- Resultado numérico SEM UNIDADE
-- Valor de referência (apenas os números, sem texto adicional OU MESMO UNIDADES DE MEDIDA)
+        const prompt = `Analise o seguinte texto de um documento de exames laboratoriais e extraia as informações conforme estas instruções EXATAS:
 
-Formato exato para resultados únicos:
-"Nome do Exame: Resultado Unidade | VR: Valor mínimo - Valor máximo"
+1. EXTRAIA APENAS:
+   - Nome do exame (exatamente como aparece no documento)
+   - Valor numérico do resultado (sem unidades de medida)
+   - Intervalo de referência (somente os valores numéricos mínimo e máximo)
 
-Formato exato para resultados duplos (percentual e absoluto):
-"Nome do Exame: Resultado1 % / Resultado2 Unidade | VR: Valor mínimo - Valor máximo"
+2. FORMATO EXATO para cada linha:
+   "Nome do Exame: Valor | VR: Mínimo - Máximo"
 
-IMPORTANTE:
-- SEMPRE que possivel adicione o PERFIL LIPIDICO, ou seja: Colesterol, Colesterol HDL, Colesterol LDL, Colesterol VLDL e Colesterol Não-HDL
-- Sempre que possivel adicione Testosterona Total, SHBG, Testosterona Livre, Testosterona Biodisponivel
-- NUNCA adicone " - " antes de algum resultado
-- NUNCA adicione unidades de medida
-- Nunca arredonde casas decimais, sempre extraia o valor bruto
-- Extraia as informações de TODAS as paginas, sem excessões
-- NÃO adicione texto explicativo, notas ou métodos
-- NÃO adicione informações específicas para gestantes, idosos, etc.
-- APENAS extraia os valores principais conforme o formato acima
-- Mantenha apenas o valor final de referência, sem explicações adicionais
-- SEMPRE colocar tres asteriscos entre o resultado quando os valores estiverem fora do valor de referencia (VR), ou seja, alterados
+3. APENAS para resultados com percentual E valor absoluto, use:
+   "Nome do Exame: Percentual % / Valor absoluto | VR: Mínimo - Máximo"
 
+4. REGRAS OBRIGATÓRIAS:
+   - NUNCA adicione unidades de medida junto com os valores numéricos
+   - NÃO use hífen ou outro caractere no início da linha
+   - SEMPRE marque resultados ALTERADOS (fora do VR) adicionando *** APÓS o valor numérico
+   - NUNCA adicione texto explicativo ou notas adicionais
+   - NUNCA adicione métodos ou informações sobre a técnica utilizada
+   - MANTENHA os números EXATAMENTE como aparecem no texto (não arredonde)
+   - Para valores com sinal menor ou maior (ex: "<0,5"), mantenha exatamente como aparece
+   - Quando o valor de referência é "até X" ou "menor que X", use o formato "0 - X"
+   - Para intervalos de referência baseados em idade/sexo, escolha o mais apropriado ou use o intervalo geral
 
+5. EXAMES PRIORITÁRIOS (sempre extrair se presentes):
+   - Perfil Lipídico: Colesterol Total, HDL, LDL, VLDL, Triglicerídeos
+   - Hormônios: Testosterona Total, SHBG, Testosterona Livre, Testosterona Biodisponível, DHT, Cortisol
+   - Metabólicos: Glicose, Insulina, Hemoglobina Glicada, HOMA-IR
+   - Função Hepática: TGO/AST, TGP/ALT, GGT, Fosfatase Alcalina, Bilirrubina
+   - Função Renal: Ureia, Creatinina, Taxa de Filtração Glomerular, Ácido Úrico
+   - Vitaminas e Minerais: Ferro, Ferritina, Vitamina D, Vitamina B12, Zinco, Magnésio, Sódio, Potássio, Cálcio
+   - Hematológicos: Hemoglobina, Hematócrito, Leucócitos, Plaquetas
+   - Outros: TSH, T4 Livre, T3, Proteína C Reativa, PSA
+
+6. EXEMPLOS CORRETOS:
+   - "Glicose: 95 | VR: 70 - 99"
+   - "Colesterol Total: 220*** | VR: 0 - 190"
+   - "Hemoglobina: 13,5 | VR: 13,0 - 18,0"
+   - "Neutrófilos: 65 % / 3900 | VR: 40 - 70"
+   - "TSH: <0,01*** | VR: 0,27 - 4,20"
 
 Texto para análise:
 ${chunk}`;
@@ -286,7 +305,7 @@ ${chunk}`;
           messages: [
             { 
               role: 'system', 
-              content: 'Você é um extrator preciso de resultados de exames laboratoriais. Você segue EXATAMENTE as instruções do usuário sem adicionar nenhuma informação extra. Você extrai apenas os nomes dos exames, resultados e valores de referência básicos, sem texto explicativo adicional. Você é extremamente minimalista e objetivo.'
+              content: 'Você é um extrator especializado de resultados laboratoriais com extrema precisão. Extraia APENAS a primeira ocorrência de cada exame, mantendo a ordem exata em que aparecem no texto. Não adicione informações extras ou explicações.'
             },
             { role: 'user', content: prompt }
           ],
@@ -294,24 +313,56 @@ ${chunk}`;
           temperature: 0.1,
         });
         
-        const chunkResumo = response.choices[0].message.content.trim();
-        pageResumo += chunkResumo + '\n\n';
+        // Processar a resposta linha por linha
+        const extractedLines = response.choices[0].message.content.trim().split('\n');
+        
+        extractedLines.forEach(line => {
+          // Ignorar linhas vazias
+          if (!line.trim()) return;
+          
+          // Remover hífens no início e espaços extras
+          line = line.replace(/^-\s*/, '').trim();
+          
+          // Extrair o nome do exame para verificar duplicatas
+          const match = line.match(/^([^:]+):/);
+          if (match) {
+            const examName = match[1].trim().toLowerCase();
+            
+            // Verificar variantes comuns do mesmo exame (ex: tgo, ast, tgp, alt)
+            let examKey = examName;
+            if (/\b(tgo|ast|aspartato)\b/.test(examName)) examKey = 'tgo';
+            else if (/\b(tgp|alt|alanina)\b/.test(examName)) examKey = 'tgp';
+            else if (/\b(gamma|gama|ggt)\b/.test(examName)) examKey = 'ggt';
+            else if (/\b(glicose|glicemia)\b/.test(examName)) examKey = 'glicose';
+            
+            // Apenas adicionar se não vimos este exame antes
+            if (!seenExams.has(examKey)) {
+              seenExams.add(examKey);
+              pageResults.push(line);
+            }
+          } else {
+            // Se não conseguir extrair o nome, adicionar linha mesmo assim
+            pageResults.push(line);
+          }
+        });
       }
       
-      summaries.push({
-        page: page.page,
-        content: pageResumo.trim()
-      });
+      // Adicionar resultados desta página ao acumulado global, mantendo a ordem
+      allResults = [...allResults, ...pageResults];
+      
     } catch (error) {
       console.error(`Erro ao gerar resumo para a página ${page.page}:`, error);
-      summaries.push({
-        page: page.page,
-        content: `Paciente: ${patientName}\n\nErro ao gerar resumo para esta página.`
-      });
     }
   }
   
-  return summaries;
+  // Montar o resumo final com todos os resultados coletados
+  let finalContent = `Paciente: ${patientName}\n\n` + allResults.join('\n');
+  
+  // Retornar como um único resumo
+  return [{
+    page: 1,
+    content: finalContent
+  }];
 }
 
 // Função para remover duplicatas nos resultados
