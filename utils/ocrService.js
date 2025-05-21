@@ -6,9 +6,8 @@ const { PDFDocument } = require('pdf-lib');
 const { splitPDF, savePdfPartsToFiles, cleanupTempFiles } = require('./pdfSplitter');
 
 /**
- * Processa um PDF usando OCR.space API para extrair texto
- * @param {string} pdfPath - Caminho do arquivo PDF
- * @returns {Promise<Array>} - Array de objetos com página e texto extraído
+ * @param {string} pdfPath 
+ * @returns {Promise<Array>} 
  */
 async function processOcr(pdfPath) {
   try {
@@ -18,7 +17,7 @@ async function processOcr(pdfPath) {
     if (!fs.existsSync(pdfPath)) {
       throw new Error(`Arquivo não encontrado: ${pdfPath}`);
     }
-    
+
     // Verificar tamanho do arquivo
     const fileStats = fs.statSync(pdfPath);
     const fileSizeKB = Math.round(fileStats.size / 1024);
@@ -31,18 +30,19 @@ async function processOcr(pdfPath) {
     const pdfBuffer = fs.readFileSync(pdfPath);
     
     // Se o arquivo for maior que o limite, dividir em partes usando seu splitPDF existente
+    // Nota: Com OCR.space PRO, o limite é maior, mas ainda é bom dividir arquivos muito grandes
     let pdfParts = [pdfBuffer];
-    if (fileSizeKB > 1000) {
-      console.log(`Arquivo excede limite de 1MB para API gratuita, dividindo em partes...`);
+    if (fileSizeKB > 5000) { // Aumentado o limite para 5MB com a versão PRO
+      console.log(`Arquivo grande, dividindo em partes...`);
       
       // Aqui estamos aproveitando seu código existente de splitPDF!
-      pdfParts = await splitPDF(pdfBuffer, 1); // 1 página por parte para garantir tamanho pequeno
+      pdfParts = await splitPDF(pdfBuffer, 1); // 1 página por parte
       console.log(`PDF dividido em ${pdfParts.length} partes para OCR`);
       
       // Reduzir tamanho se alguma parte ainda estiver muito grande
       for (let i = 0; i < pdfParts.length; i++) {
         const partSizeKB = Math.round(pdfParts[i].length / 1024);
-        if (partSizeKB > 950) {
+        if (partSizeKB > 4500) { // Aumentado para 4.5MB com a versão PRO
           console.log(`Parte ${i+1} ainda está grande (${partSizeKB}KB), reduzindo qualidade...`);
           try {
             pdfParts[i] = await reducePdfQuality(pdfParts[i]);
@@ -66,6 +66,45 @@ async function processOcr(pdfPath) {
     // Array para armazenar todos os resultados OCR
     const allResults = [];
     
+    // Função para chamar a API OCR.space com fallback automático entre datacenters
+    async function callOcrApi(formData, apiKey, attempt = 1) {
+      const endpoints = [
+        'https://apipro1.ocr.space/parse/image', // Endpoint primário PRO
+        'https://apipro2.ocr.space/parse/image'  // Endpoint de backup PRO
+      ];
+      
+      // Determinar qual endpoint usar, baseado na tentativa atual
+      const endpoint = endpoints[attempt - 1] || endpoints[0];
+      
+      try {
+        console.log(`Tentativa ${attempt}: Chamando API OCR.space PRO (${endpoint})...`);
+        
+        // Chamar a API OCR.space
+        const response = await axios.post(
+          endpoint,
+          formData,
+          {
+            headers: {
+              ...formData.getHeaders(),
+              'apikey': apiKey
+            },
+            timeout: 120000 // 120 segundos de timeout (aumentado para PDFs maiores)
+          }
+        );
+        
+        return response;
+      } catch (error) {
+        // Se for a primeira tentativa e falhou, tentar o segundo endpoint
+        if (attempt === 1) {
+          console.log(`Falha no primeiro endpoint, tentando o segundo...`);
+          return callOcrApi(formData, apiKey, 2);
+        }
+        
+        // Se já tentamos ambos os endpoints, propagar o erro
+        throw error;
+      }
+    }
+    
     // Processar cada parte
     for (let partIndex = 0; partIndex < partPaths.length; partIndex++) {
       const partPath = partPaths[partIndex];
@@ -73,11 +112,11 @@ async function processOcr(pdfPath) {
       console.log(`Processando parte ${partIndex+1}/${partPaths.length}: ${partPath} (${partSize}KB)`);
       
       // Verificar se a parte ainda é grande demais
-      if (partSize > 1000) {
-        console.warn(`Parte ${partIndex+1} ainda excede limite de 1MB (${partSize}KB), pulando...`);
+      if (partSize > 5000) { // Limite aumentado para 5MB com a versão PRO
+        console.warn(`Parte ${partIndex+1} ainda excede limite de 5MB (${partSize}KB), pulando...`);
         allResults.push({
           page: `Parte ${partIndex+1}`,
-          text: `Esta parte do documento é muito grande para OCR (${partSize}KB > 1000KB limite).`
+          text: `Esta parte do documento é muito grande para OCR (${partSize}KB > 5000KB limite).`
         });
         continue;
       }
@@ -95,23 +134,18 @@ async function processOcr(pdfPath) {
         formData.append('isCreateSearchablePdf', 'false');
         formData.append('isSearchablePdfHideTextLayer', 'false');
         
+        // Parâmetros adicionais disponíveis na versão PRO
+        formData.append('isTable', 'true');           // Melhor detecção de tabelas
+        formData.append('filetype', 'pdf');           // Especificar tipo de arquivo
+        formData.append('detectCheckbox', 'true');    // Detecção de checkbox (PRO)
+        
         // Obter API Key de variável de ambiente
-        const apiKey = process.env.OCR_API_KEY || 'helloworld';
+        const apiKey = process.env.OCR_API_KEY || 'GP88XS76NESKX'; // Nova chave PRO
         
         console.log(`Enviando parte ${partIndex+1} para processamento OCR...`);
         
-        // Chamar a API OCR.space
-        const response = await axios.post(
-          'https://api.ocr.space/parse/image',
-          formData,
-          {
-            headers: {
-              ...formData.getHeaders(),
-              'apikey': apiKey
-            },
-            timeout: 60000 // 60 segundos de timeout
-          }
-        );
+        // Chamar a API OCR.space com fallback automático
+        const response = await callOcrApi(formData, apiKey);
         
         // Validar resposta
         if (response.data && response.data.ParsedResults) {

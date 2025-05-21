@@ -85,12 +85,78 @@ const upload = multer({
   }
 });
 
-// Função para extrair o nome do paciente do PDF
-async function extractPatientName(pages) {
+// Nova função para extrair o nome do paciente via OCR
+async function extractPatientNameViaOcr(filePath) {
   try {
-    // Se não temos páginas ou texto, retornar valor padrão
+    console.log("Extraindo nome do paciente via OCR (fallback)...");
+    
+    // Executar OCR no arquivo
+    const ocrResults = await processOcr(filePath);
+    
+    if (!ocrResults || ocrResults.length === 0 || !ocrResults[0].text) {
+      throw new Error("OCR não retornou resultados utilizáveis");
+    }
+    
+    // Extrair nome do paciente do texto OCR
+    const initialOcrText = ocrResults[0].text.slice(0, 3000);
+    
+    // Tentar regex primeiro
+    const regexPatterns = [
+      /Paciente\s*[:]\s*([A-ZÀ-ÚÇ\s]+)/i,
+      /Nome do Paciente\s*[:]\s*([A-ZÀ-ÚÇ\s]+)/i,
+      /Paciente[:]?\s+([A-ZÀ-ÚÇ][A-ZÀ-ÚÇa-zà-úç\s]+)/,
+      /Nome[:]?\s+([A-ZÀ-ÚÇ][A-ZÀ-ÚÇa-zà-úç\s]+)/
+    ];
+    
+    for (const pattern of regexPatterns) {
+      const match = initialOcrText.match(pattern);
+      if (match && match[1]) {
+        const extractedName = match[1].trim();
+        if (extractedName.length > 3 && extractedName.includes(' ')) {
+          console.log(`Nome extraído via OCR regex: ${extractedName}`);
+          return extractedName;
+        }
+      }
+    }
+    
+    // Se regex falhar, usar GPT no resultado OCR
+    console.log("Usando GPT para extrair o nome do paciente do texto OCR...");
+    const response = await openai.chat.completions.create({
+      model: 'gpt-3.5-turbo',
+      messages: [
+        { 
+          role: 'system', 
+          content: 'Você é um extrator preciso de informações de documentos médicos. Você extrai apenas o nome completo do paciente sem adicionar nenhuma informação extra.'
+        },
+        { 
+          role: 'user', 
+          content: `Extraia APENAS o nome completo do paciente do seguinte trecho de um exame laboratorial processado por OCR. 
+          Retorne SOMENTE o nome completo, sem nenhum texto adicional, prefixo ou sufixo.
+          
+          Texto para análise:
+          ${initialOcrText}` 
+        }
+      ],
+      max_tokens: 100,
+      temperature: 0.1,
+    });
+    
+    const patientName = response.choices[0].message.content.trim();
+    console.log(`Nome extraído via OCR + GPT: ${patientName}`);
+    return patientName;
+  } catch (error) {
+    console.error("Erro ao extrair nome via OCR:", error);
+    return "Nome do Paciente não identificado";
+  }
+}
+
+// Função para extrair o nome do paciente do PDF com fallback para OCR
+async function extractPatientName(pages, filePath) {
+  try {
+    // Se não temos páginas ou texto, recorrer ao OCR imediatamente
     if (!pages || !pages.length || !pages[0].text) {
-      return 'Nome do Paciente não identificado';
+      console.log("Sem texto extraível, recorrendo ao OCR para nome do paciente...");
+      return await extractPatientNameViaOcr(filePath);
     }
     
     // Pegamos apenas o início do documento para encontrar o nome do paciente
@@ -128,7 +194,7 @@ async function extractPatientName(pages) {
           role: 'user', 
           content: `Extraia APENAS o nome completo do paciente do seguinte trecho de um exame laboratorial. 
           Retorne SOMENTE o nome completo, sem nenhum texto adicional, prefixo ou sufixo.
-          Se você não conseguir identificar o nome com certeza, retorne "Nome do Paciente não identificado".
+          Se você não conseguir identificar o nome com certeza, retorne "FALLBACK_TO_OCR".
           
           Texto para análise:
           ${initialText}` 
@@ -139,10 +205,28 @@ async function extractPatientName(pages) {
     });
     
     const patientName = response.choices[0].message.content.trim();
+    
+    // Se o GPT não conseguiu extrair o nome com confiança, tentar OCR como fallback
+    if (patientName === "FALLBACK_TO_OCR" || 
+        patientName === "Nome do Paciente não identificado" || 
+        patientName.length < 4 || 
+        !patientName.includes(" ")) {
+      console.log("GPT não conseguiu extrair o nome com confiança. Tentando OCR como fallback...");
+      return await extractPatientNameViaOcr(filePath);
+    }
+    
     return patientName;
   } catch (error) {
     console.error('Erro ao extrair nome do paciente:', error);
-    return 'Nome do Paciente não identificado';
+    
+    // Se ocorrer um erro, tentamos OCR como último recurso
+    try {
+      console.log("Erro na extração normal, tentando OCR como fallback...");
+      return await extractPatientNameViaOcr(filePath);
+    } catch (ocrError) {
+      console.error('Erro ao extrair nome via OCR:', ocrError);
+      return 'Nome do Paciente não identificado';
+    }
   }
 }
 
@@ -180,6 +264,9 @@ Formato exato para resultados duplos (percentual e absoluto):
 "Nome do Exame: Resultado1 % / Resultado2 Unidade | VR: Valor mínimo - Valor máximo"
 
 IMPORTANTE:
+- SEMPRE que possivel adicione o PERFIL LIPIDICO, ou seja: Colesterol, Colesterol HDL, Colesterol LDL, Colesterol VLDL e Colesterol Não-HDL
+- Sempre que possivel adicione Testosterona Total, SHBG, Testosterona Livre, Testosterona Biodisponivel
+- NUNCA adicone " - " antes de algum resultado
 - NUNCA adicione unidades de medida
 - Nunca arredonde casas decimais, sempre extraia o valor bruto
 - Extraia as informações de TODAS as paginas, sem excessões
@@ -187,7 +274,7 @@ IMPORTANTE:
 - NÃO adicione informações específicas para gestantes, idosos, etc.
 - APENAS extraia os valores principais conforme o formato acima
 - Mantenha apenas o valor final de referência, sem explicações adicionais
-- Colocar tres asteriscos apos resultado quando os valores estiverem fora do valor de referencia (VR), ou seja, alterados
+- SEMPRE colocar tres asteriscos entre o resultado quando os valores estiverem fora do valor de referencia (VR), ou seja, alterados
 
 
 
@@ -400,7 +487,7 @@ app.post('/api/upload', upload.single('pdf'), async (req, res) => {
             extractionMethod = 'ocr_api';
             
             // Extrair nome do paciente do texto OCR
-            patientName = await extractPatientName(ocrResults);
+            patientName = await extractPatientName(ocrResults, filePath);
             console.log(`Nome do paciente identificado via OCR: ${patientName}`);
             
             // Preparar os resumos
@@ -523,7 +610,9 @@ app.post('/api/upload', upload.single('pdf'), async (req, res) => {
         // Extrair texto da primeira parte para obter o nome do paciente
         console.log("Extraindo informações do paciente...");
         const initialPages = await parsePdf(pdfParts[0]);
-        patientName = await extractPatientName(initialPages);
+        
+        // Usar a nova função de extração de nome com fallback para OCR
+        patientName = await extractPatientName(initialPages, filePath);
         console.log(`Nome do paciente identificado: ${patientName}`);
         
         const allSummaries = [];
@@ -612,6 +701,11 @@ app.post('/api/upload', upload.single('pdf'), async (req, res) => {
         console.error(`Erro ao remover arquivo original ${filePath}:`, unlinkError);
       }
       
+      // Retornar erro
+      res.status(500).json({ 
+        message: 'Erro ao processar o documento: ' + processingError.message,
+        error: processingError.toString()
+      });
       // Retornar erro
       res.status(500).json({ 
         message: 'Erro ao processar o documento: ' + processingError.message,
