@@ -27,6 +27,24 @@ const PORT = process.env.PORT || 5000;
 const isVercel = isVercelEnvironment();
 console.log(`Ambiente: ${isVercel ? 'Vercel' : 'Local'}`);
 
+// ADIÇÃO: Verificação crítica de variáveis de ambiente para debug
+function checkEnvironmentVariables() {
+  const vars = {
+    OPENAI_API_KEY: !!process.env.OPENAI_API_KEY,
+    VERCEL_BLOB_READ_WRITE_TOKEN: !!(process.env.VERCEL_BLOB_READ_WRITE_TOKEN || process.env.BLOB_READ_WRITE_TOKEN),
+    OCR_API_KEY: !!(process.env.OCR_API_KEY && process.env.OCR_API_KEY !== 'helloworld')
+  };
+  
+  console.log('🔍 Status das variáveis de ambiente:');
+  Object.entries(vars).forEach(([key, value]) => {
+    console.log(`${value ? '✅' : '❌'} ${key}: ${value ? 'Configurada' : 'AUSENTE'}`);
+  });
+  
+  return vars;
+}
+
+const envStatus = checkEnvironmentVariables();
+
 // Configuração CORS melhorada para permitir acesso do frontend
 app.use(cors({
   origin: '*', // Permite qualquer origem - ajuste para produção se necessário
@@ -58,6 +76,69 @@ if (isVercel && !process.env.BLOB_READ_WRITE_TOKEN) {
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
+
+// ADIÇÃO: Função wrapper para chamadas seguras da OpenAI
+async function callOpenAISafely(messages, options = {}) {
+  const maxRetries = 3;
+  
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      console.log(`🤖 OpenAI chamada (tentativa ${attempt}/${maxRetries})...`);
+      
+      // Timeout controller
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 8000); // 8s timeout
+      
+      const response = await openai.chat.completions.create({
+        model: 'gpt-3.5-turbo',
+        temperature: 0.1,
+        max_tokens: options.max_tokens || 100,
+        ...options,
+        messages: messages
+      }, {
+        signal: controller.signal
+      });
+      
+      clearTimeout(timeoutId);
+      
+      const result = response.choices[0]?.message?.content?.trim();
+      if (!result) {
+        throw new Error('OpenAI retornou resposta vazia');
+      }
+      
+      console.log('✅ OpenAI respondeu com sucesso');
+      return result;
+      
+    } catch (error) {
+      console.error(`❌ OpenAI tentativa ${attempt} falhou:`, error.message);
+      
+      // Detectar erro de JSON parsing
+      if (error.message.includes('Unexpected token')) {
+        console.error('🚨 ERRO JSON detectado - possível problema de autenticação ou rate limit');
+      }
+      
+      // Rate limit handling
+      if (error.status === 429 || error.code === 'rate_limit_exceeded') {
+        console.log('⏳ Rate limit detectado, aguardando...');
+        if (attempt < maxRetries) {
+          await new Promise(resolve => setTimeout(resolve, 2000 * attempt));
+          continue;
+        }
+      }
+      
+      // Authentication error
+      if (error.status === 401 || error.code === 'invalid_api_key') {
+        throw new Error('API Key da OpenAI inválida ou expirada');
+      }
+      
+      if (attempt === maxRetries) {
+        throw new Error(`OpenAI falhou após ${maxRetries} tentativas: ${error.message}`);
+      }
+      
+      await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
+    }
+  }
+}
 
 // Configurar diretório de uploads
 const uploadDir = isVercel ? '/tmp' : 'uploads';
@@ -151,29 +232,25 @@ async function extractPatientNameViaOcr(filePath) {
       }
     }
     
-    // Se regex falhar, usar GPT no resultado OCR
+    // CORREÇÃO: Se regex falhar, usar a função wrapper segura para GPT
     console.log("Usando GPT para extrair o nome do paciente do texto OCR...");
-    const response = await openai.chat.completions.create({
-      model: 'gpt-3.5-turbo',
-      messages: [
-        { 
-          role: 'system', 
-          content: 'Você é um extrator preciso de informações de documentos médicos. Você extrai apenas o nome completo do paciente sem adicionar nenhuma informação extra.'
-        },
-        { 
-          role: 'user', 
-          content: `Extraia APENAS o nome completo do paciente do seguinte trecho de um exame laboratorial processado por OCR. 
-          Retorne SOMENTE o nome completo, sem nenhum texto adicional, prefixo ou sufixo.
-          
-          Texto para análise:
-          ${initialOcrText}` 
-        }
-      ],
-      max_tokens: 100,
-      temperature: 0.1,
-    });
     
-    const patientName = response.choices[0].message.content.trim();
+    const messages = [
+      { 
+        role: 'system', 
+        content: 'Você é um extrator preciso de informações de documentos médicos. Você extrai apenas o nome completo do paciente sem adicionar nenhuma informação extra.'
+      },
+      { 
+        role: 'user', 
+        content: `Extraia APENAS o nome completo do paciente do seguinte trecho de um exame laboratorial processado por OCR. 
+        Retorne SOMENTE o nome completo, sem nenhum texto adicional, prefixo ou sufixo.
+        
+        Texto para análise:
+        ${initialOcrText}` 
+      }
+    ];
+    
+    const patientName = await callOpenAISafely(messages, { max_tokens: 100 });
     console.log(`Nome extraído via OCR + GPT: ${patientName}`);
     return patientName;
   } catch (error) {
@@ -213,30 +290,26 @@ async function extractPatientName(pages, filePath) {
       }
     }
     
-    // Se não conseguiu extrair com regex, usa o GPT
+    // CORREÇÃO: Se não conseguiu extrair com regex, usa o wrapper seguro para GPT
     console.log("Usando GPT para extrair o nome do paciente...");
-    const response = await openai.chat.completions.create({
-      model: 'gpt-3.5-turbo',
-      messages: [
-        { 
-          role: 'system', 
-          content: 'Você é um extrator preciso de informações de documentos médicos. Você extrai apenas o nome completo do paciente sem adicionar nenhuma informação extra.'
-        },
-        { 
-          role: 'user', 
-          content: `Extraia APENAS o nome completo do paciente do seguinte trecho de um exame laboratorial. 
-          Retorne SOMENTE o nome completo, sem nenhum texto adicional, prefixo ou sufixo.
-          Se você não conseguir identificar o nome com certeza, retorne "FALLBACK_TO_OCR".
-          
-          Texto para análise:
-          ${initialText}` 
-        }
-      ],
-      max_tokens: 100,
-      temperature: 0.1,
-    });
     
-    const patientName = response.choices[0].message.content.trim();
+    const messages = [
+      { 
+        role: 'system', 
+        content: 'Você é um extrator preciso de informações de documentos médicos. Você extrai apenas o nome completo do paciente sem adicionar nenhuma informação extra.'
+      },
+      { 
+        role: 'user', 
+        content: `Extraia APENAS o nome completo do paciente do seguinte trecho de um exame laboratorial. 
+        Retorne SOMENTE o nome completo, sem nenhum texto adicional, prefixo ou sufixo.
+        Se você não conseguir identificar o nome com certeza, retorne "FALLBACK_TO_OCR".
+        
+        Texto para análise:
+        ${initialText}` 
+      }
+    ];
+    
+    const patientName = await callOpenAISafely(messages, { max_tokens: 100 });
     
     // Se o GPT não conseguiu extrair o nome com confiança, tentar OCR como fallback
     if (patientName === "FALLBACK_TO_OCR" || 
@@ -287,8 +360,9 @@ async function generateSummaries(pages, patientName) {
       let pageResults = [];
       
       for (const chunk of textChunks) {
-        // Prompt específico para extrair apenas referências numéricas com valores
-        const prompt = `Analise o seguinte texto de um documento de exames laboratoriais e extraia as informações conforme estas instruções EXATAS:
+        try {
+          // Prompt específico para extrair apenas referências numéricas com valores
+          const prompt = `Analise o seguinte texto de um documento de exames laboratoriais e extraia as informações conforme estas instruções EXATAS:
 
 1. EXTRAIA APENAS:
    - Nome do exame (exatamente como aparece no documento)
@@ -331,52 +405,55 @@ async function generateSummaries(pages, patientName) {
 
 Texto para análise:
 ${chunk}`;
-        
-        const response = await openai.chat.completions.create({
-          model: 'gpt-3.5-turbo',
-          messages: [
+          
+          // CORREÇÃO: Usar função wrapper segura
+          const messages = [
             { 
               role: 'system', 
               content: 'Você é um extrator especializado de resultados laboratoriais com extrema precisão. Extraia APENAS a primeira ocorrência de cada exame, mantendo a ordem exata em que aparecem no texto. Não adicione informações extras ou explicações.'
             },
             { role: 'user', content: prompt }
-          ],
-          max_tokens: 1000,
-          temperature: 0.1,
-        });
-        
-        // Processar a resposta linha por linha
-        const extractedLines = response.choices[0].message.content.trim().split('\n');
-        
-        extractedLines.forEach(line => {
-          // Ignorar linhas vazias
-          if (!line.trim()) return;
+          ];
           
-          // Remover hífens no início e espaços extras
-          line = line.replace(/^-\s*/, '').trim();
+          const responseContent = await callOpenAISafely(messages, { max_tokens: 1000 });
           
-          // Extrair o nome do exame para verificar duplicatas
-          const match = line.match(/^([^:]+):/);
-          if (match) {
-            const examName = match[1].trim().toLowerCase();
+          // Processar a resposta linha por linha
+          const extractedLines = responseContent.trim().split('\n');
+          
+          extractedLines.forEach(line => {
+            // Ignorar linhas vazias
+            if (!line.trim()) return;
             
-            // Verificar variantes comuns do mesmo exame (ex: tgo, ast, tgp, alt)
-            let examKey = examName;
-            if (/\b(tgo|ast|aspartato)\b/.test(examName)) examKey = 'tgo';
-            else if (/\b(tgp|alt|alanina)\b/.test(examName)) examKey = 'tgp';
-            else if (/\b(gamma|gama|ggt)\b/.test(examName)) examKey = 'ggt';
-            else if (/\b(glicose|glicemia)\b/.test(examName)) examKey = 'glicose';
+            // Remover hífens no início e espaços extras
+            line = line.replace(/^-\s*/, '').trim();
             
-            // Apenas adicionar se não vimos este exame antes
-            if (!seenExams.has(examKey)) {
-              seenExams.add(examKey);
+            // Extrair o nome do exame para verificar duplicatas
+            const match = line.match(/^([^:]+):/);
+            if (match) {
+              const examName = match[1].trim().toLowerCase();
+              
+              // Verificar variantes comuns do mesmo exame (ex: tgo, ast, tgp, alt)
+              let examKey = examName;
+              if (/\b(tgo|ast|aspartato)\b/.test(examName)) examKey = 'tgo';
+              else if (/\b(tgp|alt|alanina)\b/.test(examName)) examKey = 'tgp';
+              else if (/\b(gamma|gama|ggt)\b/.test(examName)) examKey = 'ggt';
+              else if (/\b(glicose|glicemia)\b/.test(examName)) examKey = 'glicose';
+              
+              // Apenas adicionar se não vimos este exame antes
+              if (!seenExams.has(examKey)) {
+                seenExams.add(examKey);
+                pageResults.push(line);
+              }
+            } else {
+              // Se não conseguir extrair o nome, adicionar linha mesmo assim
               pageResults.push(line);
             }
-          } else {
-            // Se não conseguir extrair o nome, adicionar linha mesmo assim
-            pageResults.push(line);
-          }
-        });
+          });
+          
+        } catch (chunkError) {
+          console.error('❌ Erro ao processar chunk:', chunkError.message);
+          // Continuar processamento mesmo com erro
+        }
       }
       
       // Adicionar resultados desta página ao acumulado global, mantendo a ordem
@@ -633,6 +710,8 @@ async function processPdfMain(pdfBuffer, filename, filePath = null) {
 
 // Rota para a página inicial
 app.get('/', (req, res) => {
+  const envStatusText = envStatus.OPENAI_API_KEY ? '✅ Configurado' : '❌ Faltam variáveis';
+  
   res.send(`
     <!DOCTYPE html>
     <html lang="pt-br">
@@ -690,10 +769,22 @@ app.get('/', (req, res) => {
                 border-radius: 5px;
                 margin: 20px 0;
             }
+            .status {
+                padding: 10px;
+                border-radius: 5px;
+                margin: 10px 0;
+            }
+            .success { background: #d4edda; color: #155724; }
+            .error { background: #f8d7da; color: #721c24; }
         </style>
     </head>
     <body>
         <h1>API de Processamento de Exames</h1>
+        
+        <div class="status ${envStatus.OPENAI_API_KEY ? 'success' : 'error'}">
+            <strong>Status:</strong> ${envStatusText}
+        </div>
+        
         <p>Esta é a API do sistema de processamento de laudos laboratoriais. Esta API fornece endpoints para processar arquivos PDF de exames médicos e extrair informações relevantes.</p>
         
         <h2>Endpoints Disponíveis</h2>
@@ -726,7 +817,8 @@ app.get('/', (req, res) => {
         <footer>
             &copy; 2025 Instituto Paulo Godoi - API de Processamento de Exames
             <p>Ambiente: ${isVercel ? 'Vercel (Produção)' : 'Local (Desenvolvimento)'}</p>
-            <p>Blob Storage: ${process.env.BLOB_READ_WRITE_TOKEN ? 'Configurado' : 'Não configurado'}</p>
+            <p>OpenAI: ${envStatus.OPENAI_API_KEY ? '✅' : '❌'}</p>
+            <p>Blob Storage: ${envStatus.VERCEL_BLOB_READ_WRITE_TOKEN ? '✅' : '❌'}</p>
         </footer>
     </body>
     </html>
@@ -736,10 +828,14 @@ app.get('/', (req, res) => {
 // Rota para verificação de saúde da API
 app.get('/api/health', (req, res) => {
   res.json({ 
-    status: 'ok', 
+    status: envStatus.OPENAI_API_KEY ? 'ok' : 'error', 
     env: isVercel ? 'vercel' : 'local',
     timestamp: new Date().toISOString(),
-    blobSupport: !!process.env.BLOB_READ_WRITE_TOKEN,
+    services: {
+      openai: envStatus.OPENAI_API_KEY,
+      blob: envStatus.VERCEL_BLOB_READ_WRITE_TOKEN,
+      ocr: envStatus.OCR_API_KEY
+    },
     limits: {
       smallFiles: '4.5MB (upload direto)',
       largeFiles: '100MB (via Blob)'
@@ -750,6 +846,14 @@ app.get('/api/health', (req, res) => {
 // Rota para upload de PDFs pequenos (método original)
 app.post('/api/upload', upload.single('pdf'), async (req, res) => {
   try {
+    // ADIÇÃO: Verificar se OpenAI está configurado
+    if (!envStatus.OPENAI_API_KEY) {
+      return res.status(500).json({
+        message: 'OpenAI não configurado - verifique OPENAI_API_KEY',
+        error: 'MISSING_OPENAI_KEY'
+      });
+    }
+    
     if (!req.file) {
       return res.status(400).json({ message: 'Nenhum arquivo foi enviado' });
     }
@@ -760,258 +864,39 @@ app.post('/api/upload', upload.single('pdf'), async (req, res) => {
     
     console.log(`Arquivo recebido via upload direto: ${req.file.originalname} (${fileSizeMB.toFixed(2)}MB)`);
     
-    // Lista para armazenar caminhos de arquivos temporários para limpeza
-    let tempFiles = [];
-    let patientName = 'Nome do Paciente não identificado';
-    let extractionMethod = 'normal';
-    let errorDetails = null;
-    
     try {
       // Ler o arquivo PDF
       const pdfBuffer = fs.readFileSync(filePath);
       console.log(`Arquivo lido com sucesso, tamanho: ${pdfBuffer.length} bytes`);
       
-      // Passo 1: Validar o PDF
-      console.log("Validando o PDF...");
-      const validationResult = await validatePdf(filePath);
-      console.log("Resultado da validação:", validationResult.message);
-      
-      // Passo 2: Verificar se o PDF está criptografado
-      const isEncrypted = await isPdfEncrypted(filePath);
-      console.log(`PDF está criptografado? ${isEncrypted ? 'Sim' : 'Não'}`);
-      
-      // Array para armazenar os resultados das tentativas
-      let processingResults = [];
-      let pdfParts = null;
-      let finalText = null;
-      
-      // ADIÇÃO: Tentar OCR primeiro se o PDF estiver criptografado
-      if (isEncrypted) {
-        try {
-          console.log("Tentativa OCR: Processando PDF protegido via API OCR...");
-          
-          // Executar OCR usando API externa
-          const ocrResults = await processOcr(filePath);
-          
-          if (ocrResults && ocrResults.length > 0 && ocrResults[0].text) {
-            console.log("OCR via API bem-sucedido!");
-            finalText = ocrResults;
-            extractionMethod = 'ocr_api';
-            
-            // Extrair nome do paciente do texto OCR
-            patientName = await extractPatientName(ocrResults, filePath);
-            console.log(`Nome do paciente identificado via OCR: ${patientName}`);
-            
-            // Preparar os resumos
-            const summaries = await generateSummaries(finalText, patientName);
-            
-            // Processar os resultados para remover duplicatas
-            const processedSummaries = summaries.map(summary => ({
-              ...summary,
-              content: removeDuplicates(summary.content)
-            }));
-            
-            // Limpar arquivos temporários
-            console.log("Limpando arquivos temporários...");
-            tempFiles.forEach(tempFile => {
-              try {
-                if (fs.existsSync(tempFile)) {
-                  fs.unlinkSync(tempFile);
-                  console.log(`Arquivo temporário removido: ${tempFile}`);
-                }
-              } catch (cleanupError) {
-                console.error(`Erro ao remover arquivo temporário ${tempFile}:`, cleanupError);
-              }
-            });
-            
-            // Limpar arquivo original
-            try {
-              if (fs.existsSync(filePath)) {
-                fs.unlinkSync(filePath);
-                console.log(`Arquivo original removido: ${filePath}`);
-              }
-            } catch (unlinkError) {
-              console.error(`Erro ao remover arquivo original ${filePath}:`, unlinkError);
-            }
-            
-            // Retornar resultados do OCR
-            return res.json({ 
-              summaries: processedSummaries,
-              patientName: patientName,
-              extractionMethod: extractionMethod,
-              uploadMethod: 'direct',
-              fileSize: fileSizeMB.toFixed(2) + 'MB',
-              processingDetails: processingResults.length > 0 ? processingResults : undefined
-            });
-          } else {
-            console.log("OCR via API não retornou texto utilizável, tentando outros métodos");
-            processingResults.push({
-              method: 'ocr_api',
-              success: false,
-              error: 'Sem texto reconhecido'
-            });
-          }
-        } catch (ocrError) {
-          console.error("Erro no processamento OCR via API:", ocrError);
-          processingResults.push({
-            method: 'ocr_api',
-            success: false,
-            error: ocrError.message
-          });
-        }
-      }
-      
-      // Se OCR falhou ou não foi utilizado, continuar com fluxo normal
-      
-      // Processando o PDF de acordo com suas características
-      if (isEncrypted && !finalText) {
-        // Se o PDF estiver criptografado, tentar remover a proteção
-        console.log("PDF está criptografado, tentando remover proteção...");
-        const decryptResult = await attemptPdfDecryption(filePath);
-        
-        if (decryptResult.success) {
-          console.log("Proteção removida com sucesso, processando PDF desprotegido...");
-          tempFiles.push(decryptResult.decryptedPath);
-          extractionMethod = 'desprotegido';
-          
-          // Usar o arquivo desprotegido para os próximos passos
-          const decryptedBuffer = fs.readFileSync(decryptResult.decryptedPath);
-          pdfParts = await splitPDF(decryptedBuffer);
-        } else {
-          console.log("Não foi possível remover a proteção, tentando reparar...");
-          processingResults.push({
-            method: 'desproteger',
-            success: false,
-            error: decryptResult.error
-          });
-          
-          // Tentar reparar o PDF
-          const repairResult = await repairPdf(filePath);
-          
-          if (repairResult.success) {
-            console.log("PDF reparado com sucesso, processando...");
-            tempFiles.push(repairResult.repairedPath);
-            extractionMethod = 'reparado';
-            
-            // Usar o arquivo reparado para os próximos passos
-            const repairedBuffer = fs.readFileSync(repairResult.repairedPath);
-            pdfParts = await splitPDF(repairedBuffer);
-          } else {
-            // Se não conseguimos desproteger nem reparar, tentar com o arquivo original
-            console.log("Não foi possível reparar, tentando processar o arquivo original...");
-            pdfParts = await splitPDF(pdfBuffer);
-          }
-        }
-      } else if (!isEncrypted) {
-        // Se o PDF não está criptografado, dividir em partes normalmente
-        console.log("Dividindo o PDF em partes menores...");
-        pdfParts = await splitPDF(pdfBuffer);
-      }
-      
-      // Se ainda não temos um resultado final do OCR, continuamos o processamento normal
-      if (!finalText) {
-        // Se não conseguimos dividir o PDF, usar o arquivo original como uma única parte
-        if (!pdfParts || pdfParts.length === 0) {
-          console.log("Falha ao dividir o PDF, usando como parte única");
-          pdfParts = [pdfBuffer];
-          if (extractionMethod === 'normal') {
-            extractionMethod = 'falha_divisao';
-          }
-        } else {
-          console.log(`PDF dividido em ${pdfParts.length} partes`);
-        }
-        
-        // Extrair texto da primeira parte para obter o nome do paciente
-        console.log("Extraindo informações do paciente...");
-        const initialPages = await parsePdf(pdfParts[0]);
-        
-        // Usar a nova função de extração de nome com fallback para OCR
-        patientName = await extractPatientName(initialPages, filePath);
-        console.log(`Nome do paciente identificado: ${patientName}`);
-        
-        const allSummaries = [];
-        
-        // Processar cada parte do PDF
-        for (let i = 0; i < pdfParts.length; i++) {
-          try {
-            console.log(`Processando parte ${i+1}/${pdfParts.length}...`);
-            const partBuffer = pdfParts[i];
-            
-            // Extrair texto desta parte
-            const pages = await parsePdf(partBuffer);
-            
-            // Gerar resumos para esta parte, incluindo o nome do paciente
-            const summaries = await generateSummaries(pages, patientName);
-            
-            // Adicionar os resumos ao array geral
-            allSummaries.push(...summaries);
-          } catch (partError) {
-            console.error(`Erro ao processar a parte ${i+1}:`, partError);
-            allSummaries.push({
-              page: `Parte ${i+1}`,
-              content: `Paciente: ${patientName}\n\nErro ao processar esta parte do documento.`
-            });
-          }
-        }
-        
-        // Processar os resultados para remover duplicatas
-        for (let i = 0; i < allSummaries.length; i++) {
-          allSummaries[i].content = removeDuplicates(allSummaries[i].content);
-        }
-        
-        // Limpar arquivos temporários
-        console.log("Limpando arquivos temporários...");
-        tempFiles.forEach(tempFile => {
-          try {
-            if (fs.existsSync(tempFile)) {
-              fs.unlinkSync(tempFile);
-              console.log(`Arquivo temporário removido: ${tempFile}`);
-            }
-          } catch (cleanupError) {
-            console.error(`Erro ao remover arquivo temporário ${tempFile}:`, cleanupError);
-          }
-        });
-        
-        // Limpar arquivo original
-        try {
-          if (fs.existsSync(filePath)) {
-            fs.unlinkSync(filePath);
-            console.log(`Arquivo original removido: ${filePath}`);
-          }
-        } catch (unlinkError) {
-          console.error(`Erro ao remover arquivo original ${filePath}:`, unlinkError);
-        }
-        
-        // Retornar resultados
-        res.json({ 
-          summaries: allSummaries,
-          patientName: patientName,
-          extractionMethod: extractionMethod,
-          uploadMethod: 'direct',
-          fileSize: fileSizeMB.toFixed(2) + 'MB',
-          processingDetails: processingResults.length > 0 ? processingResults : undefined
-        });
-      }
-    } catch (processingError) {
-      console.error("Erro global de processamento:", processingError);
-      
-      // Limpar arquivos temporários em caso de erro
-      tempFiles.forEach(tempFile => {
-        try {
-          if (fs.existsSync(tempFile)) {
-            fs.unlinkSync(tempFile);
-            console.log(`Arquivo temporário removido: ${tempFile}`);
-          }
-        } catch (cleanupError) {
-          console.error(`Erro ao remover arquivo temporário ${tempFile}:`, cleanupError);
-        }
-      });
+      // Usar a função principal de processamento
+      const results = await processPdfMain(pdfBuffer, req.file.originalname, filePath);
       
       // Limpar arquivo original
       try {
         if (fs.existsSync(filePath)) {
           fs.unlinkSync(filePath);
           console.log(`Arquivo original removido: ${filePath}`);
+        }
+      } catch (unlinkError) {
+        console.error(`Erro ao remover arquivo original ${filePath}:`, unlinkError);
+      }
+      
+      // Retornar resultados
+      res.json({ 
+        ...results,
+        uploadMethod: 'direct',
+        fileSize: fileSizeMB.toFixed(2) + 'MB'
+      });
+      
+    } catch (processingError) {
+      console.error("Erro no processamento:", processingError);
+      
+      // Limpar arquivo em caso de erro
+      try {
+        if (fs.existsSync(filePath)) {
+          fs.unlinkSync(filePath);
+          console.log(`Arquivo original removido após erro: ${filePath}`);
         }
       } catch (unlinkError) {
         console.error(`Erro ao remover arquivo original ${filePath}:`, unlinkError);
@@ -1035,6 +920,21 @@ app.post('/api/upload', upload.single('pdf'), async (req, res) => {
 // NOVA ROTA: Upload para arquivos grandes usando Vercel Blob
 app.post('/api/upload-large', async (req, res) => {
   try {
+    // ADIÇÃO: Verificar se serviços estão configurados
+    if (!envStatus.OPENAI_API_KEY) {
+      return res.status(500).json({
+        message: 'OpenAI não configurado - verifique OPENAI_API_KEY',
+        error: 'MISSING_OPENAI_KEY'
+      });
+    }
+    
+    if (!envStatus.VERCEL_BLOB_READ_WRITE_TOKEN) {
+      return res.status(500).json({
+        message: 'Vercel Blob não configurado - verifique VERCEL_BLOB_READ_WRITE_TOKEN',
+        error: 'MISSING_BLOB_TOKEN'
+      });
+    }
+    
     const { filename, fileData } = req.body;
     
     if (!filename || !fileData) {
@@ -1098,12 +998,12 @@ app.post('/api/upload-large', async (req, res) => {
 app.use((error, req, res, next) => {
   if (error instanceof multer.MulterError) {
     if (error.code === 'LIMIT_FILE_SIZE') {
-      const maxSize = isVercel ? 4 : 100;
+      const maxSize = isVercel ? 4.5 : 100;
       return res.status(413).json({
         message: `Arquivo excede o limite de ${maxSize}MB permitido`,
         error: 'FILE_TOO_LARGE',
         maxSize: maxSize + 'MB',
-        suggestion: 'Use a rota /api/upload-large para arquivos maiores que 4MB'
+        suggestion: 'Use a rota /api/upload-large para arquivos maiores que 4.5MB'
       });
     }
   }
@@ -1123,10 +1023,11 @@ app.use((error, req, res, next) => {
 // Iniciar o servidor apenas em ambiente local
 if (!isVercel) {
   app.listen(PORT, () => {
-    console.log(`Servidor rodando na porta ${PORT}`);
-    console.log(`Acesse: http://localhost:${PORT}`);
-    console.log(`Verificação de saúde: http://localhost:${PORT}/api/health`);
-    console.log(`Blob support: ${process.env.BLOB_READ_WRITE_TOKEN ? 'Sim' : 'Não'}`);
+    console.log(`🚀 Servidor rodando na porta ${PORT}`);
+    console.log(`🔗 Acesse: http://localhost:${PORT}`);
+    console.log(`❤️ Health: http://localhost:${PORT}/api/health`);
+    console.log(`🔑 OpenAI: ${envStatus.OPENAI_API_KEY ? 'Configurado' : 'AUSENTE'}`);
+    console.log(`💾 Blob: ${envStatus.VERCEL_BLOB_READ_WRITE_TOKEN ? 'Configurado' : 'AUSENTE'}`);
   });
 }
 
