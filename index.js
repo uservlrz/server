@@ -92,19 +92,19 @@ const upload = multer({
     }
   },
   limits: {
-    // Limites dinâmicos baseados no ambiente
-    fileSize: isVercel ? 4 * 1024 * 1024 : 100 * 1024 * 1024 // 4MB Vercel, 100MB local
+  // Limites dinâmicos baseados no ambiente  
+  fileSize: isVercel ? 4.5 * 1024 * 1024 : 100 * 1024 * 1024 // 4.5MB Vercel, 100MB local
   }
 });
 
 // Middleware para verificar tamanho antes do upload
 app.use('/api/upload', (req, res, next) => {
   const contentLength = parseInt(req.headers['content-length'] || '0');
-  const maxSize = isVercel ? 4 * 1024 * 1024 : 100 * 1024 * 1024;
+  const maxSize = isVercel ? 4.5 * 1024 * 1024 : 100 * 1024 * 1024;
   
   if (contentLength > maxSize) {
     const sizeMB = (contentLength / 1024 / 1024).toFixed(2);
-    const maxSizeMB = (maxSize / 1024 / 1024).toFixed(0);
+    const maxSizeMB = (maxSize / 1024 / 1024).toFixed(1);
     
     return res.status(413).json({ 
       message: `Arquivo muito grande (${sizeMB}MB). Use a rota /api/upload-large para arquivos maiores que ${maxSizeMB}MB.`,
@@ -715,8 +715,8 @@ app.get('/', (req, res) => {
         
         <div class="blob-info">
             <h3>💡 Suporte para Arquivos Grandes</h3>
-            <p><strong>Arquivos até 4MB:</strong> Use /api/upload (upload direto)</p>
-            <p><strong>Arquivos maiores que 4MB:</strong> Use /api/upload-large (via Vercel Blob)</p>
+            <p><strong>Arquivos até 4.5MB:</strong> Use /api/upload (upload direto)</p>
+            <p><strong>Arquivos maiores que 4.5MB:</strong> Use /api/upload-large (via Vercel Blob)</p>
             <p><strong>Limite máximo:</strong> 100MB por arquivo</p>
         </div>
         
@@ -741,7 +741,7 @@ app.get('/api/health', (req, res) => {
     timestamp: new Date().toISOString(),
     blobSupport: !!process.env.BLOB_READ_WRITE_TOKEN,
     limits: {
-      smallFiles: '4MB (upload direto)',
+      smallFiles: '4.5MB (upload direto)',
       largeFiles: '100MB (via Blob)'
     }
   });

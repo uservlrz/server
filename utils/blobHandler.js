@@ -112,14 +112,13 @@ async function deletePdfFromBlob(blobUrl) {
  * @returns {boolean} - True se deve usar blob
  */
 function shouldUseBlob(fileSize, isVercel = true) {
-  const VERCEL_LIMIT = 4 * 1024 * 1024; // 4MB
-  const BLOB_THRESHOLD = 3 * 1024 * 1024; // 3MB (margem de segurança)
+  const VERCEL_LIMIT = 4.5 * 1024 * 1024; // 4.5MB (limite real do Vercel)
   
   if (!isVercel) {
     return false; // Local pode usar upload direto
   }
   
-  return fileSize > BLOB_THRESHOLD;
+  return fileSize > VERCEL_LIMIT;
 }
 
 /**
