@@ -116,13 +116,26 @@ function getProtectionDescription(permissions, isLaboratoryReport) {
 
 /**
  * Detecta se um PDF está criptografado/protegido
- * @param {string} filePath - Caminho do arquivo PDF
+ * @param {string|Buffer} pdfInput - Caminho do arquivo PDF ou Buffer do PDF
  * @returns {Promise<boolean>} - True se o PDF estiver criptografado ou com permissões restritas
  */
-async function isPdfEncrypted(filePath) {
+async function isPdfEncrypted(pdfInput) {
   try {
-    // Verificar manualmente primeiro - mais rápido e pode pegar mais casos
-    const content = fs.readFileSync(filePath, 'latin1').slice(0, 20000);
+    let content;
+    let pdfBytes;
+    
+    // Verificar se é Buffer ou string (caminho)
+    if (Buffer.isBuffer(pdfInput)) {
+      // Se for Buffer, usar diretamente
+      pdfBytes = pdfInput;
+      content = pdfInput.toString('latin1').slice(0, 20000);
+    } else if (typeof pdfInput === 'string') {
+      // Se for string, ler o arquivo
+      content = fs.readFileSync(pdfInput, 'latin1').slice(0, 20000);
+      pdfBytes = fs.readFileSync(pdfInput);
+    } else {
+      throw new Error('Input deve ser um caminho de arquivo (string) ou Buffer do PDF');
+    }
     
     // Verificar se o documento tem configurações de permissão restritas
     const pMatch = content.match(/\/P\s+(-?\d+)/);
@@ -153,7 +166,6 @@ async function isPdfEncrypted(filePath) {
     }
     
     // Usar pdf-lib como verificação secundária
-    const pdfBytes = fs.readFileSync(filePath);
     try {
       const pdfDoc = await PDFDocument.load(pdfBytes, { 
         updateMetadata: false 

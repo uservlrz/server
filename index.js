@@ -1,4 +1,4 @@
-// index.js - Servidor Node.js otimizado para Vercel e ambiente local
+// index.js - Servidor Node.js otimizado para Vercel e ambiente local com Vercel Blob
 const express = require('express');
 const multer = require('multer');
 const cors = require('cors');
@@ -12,8 +12,13 @@ const { parsePdf } = require('./utils/pdfParser');
 const { validatePdf, repairPdf } = require('./utils/pdfValidator');
 const { isPdfEncrypted, attemptPdfDecryption, isVercelEnvironment } = require('./utils/pdfDecryptor');
 const { splitPDF, cleanupTempFiles } = require('./utils/pdfSplitter');
-// ADIÇÃO: Importar o serviço OCR
 const { processOcr } = require('./utils/ocrService');
+// ADIÇÃO: Importar o gerenciador do Vercel Blob
+const { 
+  shouldUseBlob, 
+  processLargePdfWithBlob, 
+  validatePdfForBlob 
+} = require('./utils/blobHandler');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -31,16 +36,22 @@ app.use(cors({
   maxAge: 86400 // 24 horas em segundos
 }));
 
-// Middleware
-app.use(express.json());
+// Middleware para parsing JSON com limite aumentado
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 // Verificar se API Keys existem
 if (!process.env.OPENAI_API_KEY) {
   console.error('ERRO: Chave da API da OpenAI não encontrada! Verifique as variáveis de ambiente.');
 }
-// ADIÇÃO: Verificar API key do OCR
+
 if (!process.env.OCR_API_KEY || process.env.OCR_API_KEY === 'helloworld') {
   console.warn('AVISO: Usando chave de API OCR padrão. Obtenha uma chave em ocr.space para melhor funcionamento.');
+}
+
+// Verificar se Vercel Blob está configurado (apenas para logs)
+if (isVercel && !process.env.BLOB_READ_WRITE_TOKEN) {
+  console.warn('AVISO: BLOB_READ_WRITE_TOKEN não encontrado. Vercel Blob pode não funcionar.');
 }
 
 // Configurar OpenAI
@@ -61,7 +72,7 @@ try {
   console.error(`Erro ao criar diretório de uploads: ${err.message}`);
 }
 
-// Configuração do Multer para upload de arquivos
+// Configuração do Multer para upload de arquivos com limites dinâmicos
 const storage = multer.diskStorage({
   destination: function (req, file, cb) {
     cb(null, uploadDir);
@@ -81,8 +92,29 @@ const upload = multer({
     }
   },
   limits: {
-    fileSize: 50 * 1024 * 1024 // Limite de 50MB
+    // Limites dinâmicos baseados no ambiente
+    fileSize: isVercel ? 4 * 1024 * 1024 : 100 * 1024 * 1024 // 4MB Vercel, 100MB local
   }
+});
+
+// Middleware para verificar tamanho antes do upload
+app.use('/api/upload', (req, res, next) => {
+  const contentLength = parseInt(req.headers['content-length'] || '0');
+  const maxSize = isVercel ? 4 * 1024 * 1024 : 100 * 1024 * 1024;
+  
+  if (contentLength > maxSize) {
+    const sizeMB = (contentLength / 1024 / 1024).toFixed(2);
+    const maxSizeMB = (maxSize / 1024 / 1024).toFixed(0);
+    
+    return res.status(413).json({ 
+      message: `Arquivo muito grande (${sizeMB}MB). Use a rota /api/upload-large para arquivos maiores que ${maxSizeMB}MB.`,
+      currentSize: sizeMB + 'MB',
+      maxSize: maxSizeMB + 'MB',
+      environment: isVercel ? 'vercel' : 'local',
+      shouldUseLargeUpload: true
+    });
+  }
+  next();
 });
 
 // Nova função para extrair o nome do paciente via OCR
@@ -395,6 +427,210 @@ function removeDuplicates(content) {
   return `${patientLine}\n\n${uniqueLines.join('\n')}`;
 }
 
+// NOVA FUNÇÃO: Processamento principal de PDF (extraída para reutilização)
+async function processPdfMain(pdfBuffer, filename, filePath = null) {
+  let tempFiles = [];
+  let patientName = 'Nome do Paciente não identificado';
+  let extractionMethod = 'normal';
+  let processingResults = [];
+  
+  try {
+    console.log(`Processando PDF: ${filename}, tamanho: ${(pdfBuffer.length / 1024 / 1024).toFixed(2)}MB`);
+    
+    // Passo 1: Validar o PDF
+    console.log("Validando o PDF...");
+    
+    // Passo 2: Verificar se o PDF está criptografado
+    const isEncrypted = await isPdfEncrypted(pdfBuffer);
+    console.log(`PDF está criptografado? ${isEncrypted ? 'Sim' : 'Não'}`);
+    
+    let pdfParts = null;
+    let finalText = null;
+    
+    // ADIÇÃO: Tentar OCR primeiro se o PDF estiver criptografado
+    if (isEncrypted) {
+      try {
+        console.log("Tentativa OCR: Processando PDF protegido via API OCR...");
+        
+        // Para usar OCR, precisamos salvar temporariamente
+        let tempPath = null;
+        if (filePath) {
+          tempPath = filePath;
+        } else {
+          tempPath = `/tmp/${Date.now()}-${filename}`;
+          fs.writeFileSync(tempPath, pdfBuffer);
+          tempFiles.push(tempPath);
+        }
+        
+        const ocrResults = await processOcr(tempPath);
+        
+        if (ocrResults && ocrResults.length > 0 && ocrResults[0].text) {
+          console.log("OCR via API bem-sucedido!");
+          finalText = ocrResults;
+          extractionMethod = 'ocr_api';
+          
+          // Extrair nome do paciente do texto OCR
+          patientName = await extractPatientName(ocrResults, tempPath);
+          console.log(`Nome do paciente identificado via OCR: ${patientName}`);
+          
+          // Preparar os resumos
+          const summaries = await generateSummaries(finalText, patientName);
+          
+          // Processar os resultados para remover duplicatas
+          const processedSummaries = summaries.map(summary => ({
+            ...summary,
+            content: removeDuplicates(summary.content)
+          }));
+          
+          return {
+            summaries: processedSummaries,
+            patientName: patientName,
+            extractionMethod: extractionMethod,
+            processingDetails: processingResults.length > 0 ? processingResults : undefined
+          };
+        } else {
+          console.log("OCR via API não retornou texto utilizável, tentando outros métodos");
+          processingResults.push({
+            method: 'ocr_api',
+            success: false,
+            error: 'Sem texto reconhecido'
+          });
+        }
+      } catch (ocrError) {
+        console.error("Erro no processamento OCR via API:", ocrError);
+        processingResults.push({
+          method: 'ocr_api',
+          success: false,
+          error: ocrError.message
+        });
+      }
+    }
+    
+    // Se OCR falhou ou não foi utilizado, continuar com fluxo normal
+    
+    // Processando o PDF de acordo com suas características
+    if (isEncrypted && !finalText) {
+      // Se o PDF estiver criptografado, tentar remover a proteção
+      console.log("PDF está criptografado, tentando remover proteção...");
+      const decryptResult = await attemptPdfDecryption(filePath || pdfBuffer);
+      
+      if (decryptResult.success) {
+        console.log("Proteção removida com sucesso, processando PDF desprotegido...");
+        tempFiles.push(decryptResult.decryptedPath);
+        extractionMethod = 'desprotegido';
+        
+        // Usar o arquivo desprotegido para os próximos passos
+        const decryptedBuffer = fs.readFileSync(decryptResult.decryptedPath);
+        pdfParts = await splitPDF(decryptedBuffer);
+      } else {
+        console.log("Não foi possível remover a proteção, tentando reparar...");
+        processingResults.push({
+          method: 'desproteger',
+          success: false,
+          error: decryptResult.error
+        });
+        
+        // Tentar reparar o PDF
+        const repairResult = await repairPdf(filePath || pdfBuffer);
+        
+        if (repairResult.success) {
+          console.log("PDF reparado com sucesso, processando...");
+          tempFiles.push(repairResult.repairedPath);
+          extractionMethod = 'reparado';
+          
+          // Usar o arquivo reparado para os próximos passos
+          const repairedBuffer = fs.readFileSync(repairResult.repairedPath);
+          pdfParts = await splitPDF(repairedBuffer);
+        } else {
+          // Se não conseguimos desproteger nem reparar, tentar com o arquivo original
+          console.log("Não foi possível reparar, tentando processar o arquivo original...");
+          pdfParts = await splitPDF(pdfBuffer);
+        }
+      }
+    } else if (!isEncrypted) {
+      // Se o PDF não está criptografado, dividir em partes normalmente
+      console.log("Dividindo o PDF em partes menores...");
+      pdfParts = await splitPDF(pdfBuffer);
+    }
+    
+    // Se ainda não temos um resultado final do OCR, continuamos o processamento normal
+    if (!finalText) {
+      // Se não conseguimos dividir o PDF, usar o arquivo original como uma única parte
+      if (!pdfParts || pdfParts.length === 0) {
+        console.log("Falha ao dividir o PDF, usando como parte única");
+        pdfParts = [pdfBuffer];
+        if (extractionMethod === 'normal') {
+          extractionMethod = 'falha_divisao';
+        }
+      } else {
+        console.log(`PDF dividido em ${pdfParts.length} partes`);
+      }
+      
+      // Extrair texto da primeira parte para obter o nome do paciente
+      console.log("Extraindo informações do paciente...");
+      const initialPages = await parsePdf(pdfParts[0]);
+      
+      // Usar a nova função de extração de nome com fallback para OCR
+      const tempPathForName = filePath || (tempFiles.length > 0 ? tempFiles[0] : null);
+      patientName = await extractPatientName(initialPages, tempPathForName);
+      console.log(`Nome do paciente identificado: ${patientName}`);
+      
+      const allSummaries = [];
+      
+      // Processar cada parte do PDF
+      for (let i = 0; i < pdfParts.length; i++) {
+        try {
+          console.log(`Processando parte ${i+1}/${pdfParts.length}...`);
+          const partBuffer = pdfParts[i];
+          
+          // Extrair texto desta parte
+          const pages = await parsePdf(partBuffer);
+          
+          // Gerar resumos para esta parte, incluindo o nome do paciente
+          const summaries = await generateSummaries(pages, patientName);
+          
+          // Adicionar os resumos ao array geral
+          allSummaries.push(...summaries);
+        } catch (partError) {
+          console.error(`Erro ao processar a parte ${i+1}:`, partError);
+          allSummaries.push({
+            page: `Parte ${i+1}`,
+            content: `Paciente: ${patientName}\n\nErro ao processar esta parte do documento.`
+          });
+        }
+      }
+      
+      // Processar os resultados para remover duplicatas
+      for (let i = 0; i < allSummaries.length; i++) {
+        allSummaries[i].content = removeDuplicates(allSummaries[i].content);
+      }
+      
+      return {
+        summaries: allSummaries,
+        patientName: patientName,
+        extractionMethod: extractionMethod,
+        processingDetails: processingResults.length > 0 ? processingResults : undefined
+      };
+    }
+    
+  } catch (error) {
+    console.error('Erro no processamento:', error);
+    throw error;
+  } finally {
+    // Limpar arquivos temporários
+    tempFiles.forEach(tempFile => {
+      try {
+        if (fs.existsSync(tempFile)) {
+          fs.unlinkSync(tempFile);
+          console.log(`Arquivo temporário removido: ${tempFile}`);
+        }
+      } catch (cleanupError) {
+        console.error(`Erro ao remover arquivo temporário ${tempFile}:`, cleanupError);
+      }
+    });
+  }
+}
+
 // Rota para a página inicial
 app.get('/', (req, res) => {
   res.send(`
@@ -448,6 +684,12 @@ app.get('/', (req, res) => {
                 font-size: 0.8em;
                 color: #7f8c8d;
             }
+            .blob-info {
+                background: #e7f3ff;
+                padding: 15px;
+                border-radius: 5px;
+                margin: 20px 0;
+            }
         </style>
     </head>
     <body>
@@ -463,7 +705,19 @@ app.get('/', (req, res) => {
         
         <div class="endpoint">
             <div><span class="method">POST</span> <span class="path">/api/upload</span></div>
-            <div class="description">Recebe um arquivo PDF de exames médicos e retorna um resumo estruturado dos dados extraídos.</div>
+            <div class="description">Recebe um arquivo PDF de exames médicos (até 4MB) e retorna um resumo estruturado dos dados extraídos.</div>
+        </div>
+        
+        <div class="endpoint">
+            <div><span class="method">POST</span> <span class="path">/api/upload-large</span></div>
+            <div class="description">Processa arquivos PDF grandes (até 100MB) usando Vercel Blob storage.</div>
+        </div>
+        
+        <div class="blob-info">
+            <h3>💡 Suporte para Arquivos Grandes</h3>
+            <p><strong>Arquivos até 4MB:</strong> Use /api/upload (upload direto)</p>
+            <p><strong>Arquivos maiores que 4MB:</strong> Use /api/upload-large (via Vercel Blob)</p>
+            <p><strong>Limite máximo:</strong> 100MB por arquivo</p>
         </div>
         
         <h2>Como Usar</h2>
@@ -472,6 +726,7 @@ app.get('/', (req, res) => {
         <footer>
             &copy; 2025 Instituto Paulo Godoi - API de Processamento de Exames
             <p>Ambiente: ${isVercel ? 'Vercel (Produção)' : 'Local (Desenvolvimento)'}</p>
+            <p>Blob Storage: ${process.env.BLOB_READ_WRITE_TOKEN ? 'Configurado' : 'Não configurado'}</p>
         </footer>
     </body>
     </html>
@@ -483,21 +738,27 @@ app.get('/api/health', (req, res) => {
   res.json({ 
     status: 'ok', 
     env: isVercel ? 'vercel' : 'local',
-    timestamp: new Date().toISOString()
+    timestamp: new Date().toISOString(),
+    blobSupport: !!process.env.BLOB_READ_WRITE_TOKEN,
+    limits: {
+      smallFiles: '4MB (upload direto)',
+      largeFiles: '100MB (via Blob)'
+    }
   });
 });
 
-// Rota para o upload do PDF com tratamento para PDFs problemáticos
-// Usando apenas bibliotecas compatíveis com Vercel
+// Rota para upload de PDFs pequenos (método original)
 app.post('/api/upload', upload.single('pdf'), async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({ message: 'Nenhum arquivo foi enviado' });
     }
 
-    // Caminho do arquivo simplificado
     const filePath = req.file.path;
-    console.log(`Arquivo recebido: ${filePath}`);
+    const fileSize = fs.statSync(filePath).size;
+    const fileSizeMB = fileSize / (1024 * 1024);
+    
+    console.log(`Arquivo recebido via upload direto: ${req.file.originalname} (${fileSizeMB.toFixed(2)}MB)`);
     
     // Lista para armazenar caminhos de arquivos temporários para limpeza
     let tempFiles = [];
@@ -578,6 +839,8 @@ app.post('/api/upload', upload.single('pdf'), async (req, res) => {
               summaries: processedSummaries,
               patientName: patientName,
               extractionMethod: extractionMethod,
+              uploadMethod: 'direct',
+              fileSize: fileSizeMB.toFixed(2) + 'MB',
               processingDetails: processingResults.length > 0 ? processingResults : undefined
             });
           } else {
@@ -724,6 +987,8 @@ app.post('/api/upload', upload.single('pdf'), async (req, res) => {
           summaries: allSummaries,
           patientName: patientName,
           extractionMethod: extractionMethod,
+          uploadMethod: 'direct',
+          fileSize: fileSizeMB.toFixed(2) + 'MB',
           processingDetails: processingResults.length > 0 ? processingResults : undefined
         });
       }
@@ -757,11 +1022,6 @@ app.post('/api/upload', upload.single('pdf'), async (req, res) => {
         message: 'Erro ao processar o documento: ' + processingError.message,
         error: processingError.toString()
       });
-      // Retornar erro
-      res.status(500).json({ 
-        message: 'Erro ao processar o documento: ' + processingError.message,
-        error: processingError.toString()
-      });
     }
   } catch (error) {
     console.error('Erro ao processar o PDF:', error);
@@ -772,12 +1032,101 @@ app.post('/api/upload', upload.single('pdf'), async (req, res) => {
   }
 });
 
+// NOVA ROTA: Upload para arquivos grandes usando Vercel Blob
+app.post('/api/upload-large', async (req, res) => {
+  try {
+    const { filename, fileData } = req.body;
+    
+    if (!filename || !fileData) {
+      return res.status(400).json({ 
+        message: 'Dados obrigatórios: filename e fileData (base64)' 
+      });
+    }
+    
+    console.log(`Processando arquivo grande via Blob: ${filename}`);
+    
+    // Converter base64 de volta para buffer
+    const pdfBuffer = Buffer.from(fileData, 'base64');
+    const fileSizeMB = pdfBuffer.length / (1024 * 1024);
+    
+    console.log(`Tamanho do arquivo: ${fileSizeMB.toFixed(2)}MB`);
+    
+    // Validar arquivo para blob
+    const validation = validatePdfForBlob(pdfBuffer, filename);
+    if (!validation.valid) {
+      return res.status(400).json({
+        message: validation.error,
+        size: validation.size + 'MB'
+      });
+    }
+    
+    try {
+      // Processar usando Vercel Blob
+      const results = await processLargePdfWithBlob(
+        pdfBuffer, 
+        filename, 
+        (buffer, fname) => processPdfMain(buffer, fname)
+      );
+      
+      console.log(`Arquivo processado com sucesso via Blob: ${filename}`);
+      
+      // Retornar resultados
+      res.json({
+        ...results,
+        uploadMethod: 'blob',
+        fileSize: fileSizeMB.toFixed(2) + 'MB'
+      });
+      
+    } catch (processingError) {
+      console.error("Erro no processamento via Blob:", processingError);
+      res.status(500).json({ 
+        message: 'Erro ao processar o documento via Blob: ' + processingError.message,
+        error: processingError.toString()
+      });
+    }
+    
+  } catch (error) {
+    console.error('Erro geral no upload-large:', error);
+    res.status(500).json({ 
+      message: 'Erro ao processar o documento: ' + error.message,
+      error: error.toString()
+    });
+  }
+});
+
+// Handler de erro do Multer
+app.use((error, req, res, next) => {
+  if (error instanceof multer.MulterError) {
+    if (error.code === 'LIMIT_FILE_SIZE') {
+      const maxSize = isVercel ? 4 : 100;
+      return res.status(413).json({
+        message: `Arquivo excede o limite de ${maxSize}MB permitido`,
+        error: 'FILE_TOO_LARGE',
+        maxSize: maxSize + 'MB',
+        suggestion: 'Use a rota /api/upload-large para arquivos maiores que 4MB'
+      });
+    }
+  }
+  
+  if (error.message.includes('413')) {
+    return res.status(413).json({
+      message: 'Arquivo muito grande para processamento',
+      error: 'PAYLOAD_TOO_LARGE',
+      suggestion: 'Use a rota /api/upload-large para arquivos maiores'
+    });
+  }
+  
+  console.error('Erro não tratado:', error);
+  res.status(500).json({ message: 'Erro interno do servidor', error: error.message });
+});
+
 // Iniciar o servidor apenas em ambiente local
 if (!isVercel) {
   app.listen(PORT, () => {
     console.log(`Servidor rodando na porta ${PORT}`);
     console.log(`Acesse: http://localhost:${PORT}`);
     console.log(`Verificação de saúde: http://localhost:${PORT}/api/health`);
+    console.log(`Blob support: ${process.env.BLOB_READ_WRITE_TOKEN ? 'Sim' : 'Não'}`);
   });
 }
 
