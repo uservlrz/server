@@ -1,7 +1,5 @@
-// utils/pdfDecryptor.js - Versão completamente corrigida para Buffer e String
+// utils/pdfDecryptor.js - Versão aprimorada para detecção específica de proteções
 const fs = require('fs');
-const path = require('path');
-const os = require('os');
 const { PDFDocument } = require('pdf-lib');
 
 /**
@@ -13,25 +11,13 @@ function isVercelEnvironment() {
 }
 
 /**
- * Detecta tipos específicos de proteção em um PDF - VERSÃO CORRIGIDA
- * @param {string|Buffer} pdfInput - Caminho do arquivo PDF ou Buffer
+ * Detecta tipos específicos de proteção em um PDF
+ * @param {string} filePath - Caminho do arquivo PDF
  * @returns {Promise<object>} - Tipos de proteção detectados
  */
-async function detectProtectionType(pdfInput) {
+async function detectProtectionType(filePath) {
   try {
-    let content;
-    
-    // CORREÇÃO: Verificar se é Buffer ou string (caminho)
-    if (Buffer.isBuffer(pdfInput)) {
-      content = pdfInput.toString('latin1').slice(0, 20000);
-    } else if (typeof pdfInput === 'string') {
-      if (!fs.existsSync(pdfInput)) {
-        throw new Error(`Arquivo não encontrado: ${pdfInput}`);
-      }
-      content = fs.readFileSync(pdfInput, 'latin1').slice(0, 20000);
-    } else {
-      throw new Error('Input deve ser um caminho de arquivo (string) ou Buffer do PDF');
-    }
+    const content = fs.readFileSync(filePath, 'latin1').slice(0, 20000);
     
     // Verificar flags de permissão no PDF
     // A flag "/P" no PDF controla as permissões. Cada bit representa uma permissão diferente.
@@ -90,7 +76,7 @@ async function detectProtectionType(pdfInput) {
       description: getProtectionDescription(permissions, laboratoryReportPattern)
     };
   } catch (error) {
-    console.error('❌ Erro ao analisar tipo de proteção:', error.message);
+    console.error('Erro ao analisar tipo de proteção:', error);
     return {
       isProtected: false,
       permissions: {},
@@ -129,39 +115,14 @@ function getProtectionDescription(permissions, isLaboratoryReport) {
 }
 
 /**
- * Detecta se um PDF está criptografado/protegido - VERSÃO COMPLETAMENTE CORRIGIDA
- * @param {string|Buffer} pdfInput - Caminho do arquivo PDF ou Buffer do PDF
+ * Detecta se um PDF está criptografado/protegido
+ * @param {string} filePath - Caminho do arquivo PDF
  * @returns {Promise<boolean>} - True se o PDF estiver criptografado ou com permissões restritas
  */
-async function isPdfEncrypted(pdfInput) {
+async function isPdfEncrypted(filePath) {
   try {
-    let content;
-    let pdfBytes;
-    
-    // CORREÇÃO PRINCIPAL: Verificar se é Buffer ou string (caminho)
-    if (Buffer.isBuffer(pdfInput)) {
-      // Se for Buffer, usar diretamente
-      pdfBytes = pdfInput;
-      content = pdfInput.toString('latin1').slice(0, 20000);
-      console.log('🔍 Verificando criptografia do Buffer PDF...');
-    } else if (typeof pdfInput === 'string') {
-      // Se for string, ler o arquivo
-      if (!fs.existsSync(pdfInput)) {
-        throw new Error(`Arquivo não encontrado: ${pdfInput}`);
-      }
-      content = fs.readFileSync(pdfInput, 'latin1').slice(0, 20000);
-      pdfBytes = fs.readFileSync(pdfInput);
-      console.log('🔍 Verificando criptografia do arquivo PDF...');
-    } else {
-      throw new Error('Input deve ser um caminho de arquivo (string) ou Buffer do PDF');
-    }
-    
-    // Verificar se é um PDF válido
-    const pdfHeader = pdfBytes.slice(0, 4).toString();
-    if (pdfHeader !== '%PDF') {
-      console.warn('⚠️ Arquivo não parece ser um PDF válido');
-      return false;
-    }
+    // Verificar manualmente primeiro - mais rápido e pode pegar mais casos
+    const content = fs.readFileSync(filePath, 'latin1').slice(0, 20000);
     
     // Verificar se o documento tem configurações de permissão restritas
     const pMatch = content.match(/\/P\s+(-?\d+)/);
@@ -169,7 +130,6 @@ async function isPdfEncrypted(pdfInput) {
       const permissionValue = parseInt(pMatch[1]);
       // Se valor negativo, indica permissões restritas
       if (permissionValue < 0) {
-        console.log(`🔒 PDF tem permissões restritas: ${permissionValue}`);
         return true;
       }
     }
@@ -189,98 +149,57 @@ async function isPdfEncrypted(pdfInput) {
     }
     
     if (encryptionScore >= 3) {
-      console.log(`🔒 PDF tem múltiplos marcadores de criptografia (score: ${encryptionScore})`);
       return true;
     }
     
     // Usar pdf-lib como verificação secundária
+    const pdfBytes = fs.readFileSync(filePath);
     try {
       const pdfDoc = await PDFDocument.load(pdfBytes, { 
-        updateMetadata: false,
-        throwOnInvalidObject: false
+        updateMetadata: false 
       });
-      
-      const isEncrypted = pdfDoc.isEncrypted;
-      if (isEncrypted) {
-        console.log('🔒 PDF detectado como criptografado pelo pdf-lib');
-      }
-      return isEncrypted;
-      
+      return pdfDoc.isEncrypted;
     } catch (error) {
-      console.warn('⚠️ pdf-lib falhou ao carregar PDF:', error.message);
-      
       // Se o erro contém menções a criptografia
       if (error.message && (
           error.message.includes('encrypted') || 
           error.message.includes('password') ||
           error.message.includes('Encrypt'))) {
-        console.log('🔒 Erro indica PDF criptografado');
         return true;
       }
       
       // Tentar verificação manual adicional se pdf-lib falhar
-      const manualCheck = content.includes('/Encrypt') || 
-                         content.includes('/Standard') || 
-                         (content.includes('/P ') && content.includes('/R '));
-      
-      if (manualCheck) {
-        console.log('🔒 Verificação manual detectou criptografia');
-      }
-      
-      return manualCheck;
+      return content.includes('/Encrypt') || 
+             content.includes('/Standard') || 
+             (content.includes('/P ') && content.includes('/R '));
     }
   } catch (error) {
-    console.error('❌ Erro ao verificar criptografia:', error.message);
+    console.error('Erro ao verificar criptografia:', error);
     
     // Se falhar completamente, usar heurística baseada na mensagem de erro
     if (error.message && (
         error.message.includes('encrypted') || 
         error.message.includes('password') ||
         error.message.includes('crypt'))) {
-      console.log('🔒 Mensagem de erro indica criptografia');
       return true;
     }
     
-    // Em caso de erro, assumir que não está criptografado
-    // para permitir que o processamento continue
-    console.log('⚠️ Assumindo PDF não criptografado devido ao erro');
     return false;
   }
 }
 
 /**
- * Tenta remover proteção de um PDF usando pdf-lib - VERSÃO CORRIGIDA
- * @param {string|Buffer} pdfInput - Caminho do arquivo PDF original ou Buffer
+ * Tenta remover proteção de um PDF usando pdf-lib com estratégia aprimorada para laudos laboratoriais
+ * @param {string} inputPath - Caminho do arquivo PDF original
  * @returns {Promise<object>} - Resultado da operação
  */
-async function decryptPdfWithPdfLib(pdfInput) {
-  let tempFiles = [];
-  let inputPath;
+async function decryptPdfWithPdfLib(inputPath) {
+  const outputPath = `${inputPath}_decrypted.pdf`;
   
   try {
-    // CORREÇÃO: Preparar arquivo de entrada baseado no tipo
-    if (Buffer.isBuffer(pdfInput)) {
-      // Se for Buffer, salvar temporariamente
-      inputPath = path.join(os.tmpdir(), `temp_input_${Date.now()}_${Math.random().toString(36).substr(2, 9)}.pdf`);
-      fs.writeFileSync(inputPath, pdfInput);
-      tempFiles.push(inputPath);
-      console.log('💾 Buffer salvo como arquivo temporário para processamento');
-    } else if (typeof pdfInput === 'string') {
-      if (!fs.existsSync(pdfInput)) {
-        throw new Error(`Arquivo não encontrado: ${pdfInput}`);
-      }
-      inputPath = pdfInput;
-      console.log('📄 Usando arquivo existente para processamento');
-    } else {
-      throw new Error('Input deve ser um caminho de arquivo ou Buffer');
-    }
-    
-    const outputPath = path.join(os.tmpdir(), `decrypted_${Date.now()}_${Math.random().toString(36).substr(2, 9)}.pdf`);
-    tempFiles.push(outputPath);
-    
     // Verificar tipo específico de proteção
-    const protectionInfo = await detectProtectionType(pdfInput);
-    console.log(`🔍 Tentando remover proteção (${protectionInfo.description})`);
+    const protectionInfo = await detectProtectionType(inputPath);
+    console.log(`Tentando remover proteção (${protectionInfo.description})`);
     
     // Estratégias específicas baseadas no tipo de proteção
     let useAggressive = protectionInfo.isLaboratoryReport;
@@ -300,9 +219,8 @@ async function decryptPdfWithPdfLib(pdfInput) {
         throwOnInvalidObject: false
       });
       loadMethod = 'ignoreEncryption';
-      console.log('✅ PDF carregado ignorando criptografia');
     } catch (firstError) {
-      console.log('🔄 Falha ao ignorar criptografia, tentando senhas comuns...');
+      console.log('Falha ao carregar PDF ignorando criptografia, tentando senhas comuns...');
       
       // Estratégia 2: Tentar senhas comuns
       const commonPasswords = ['', '1234', 'admin', 'password', 'pdf', 'exame', 'laudo', 'laboratorio', '123456'];
@@ -314,7 +232,6 @@ async function decryptPdfWithPdfLib(pdfInput) {
             throwOnInvalidObject: false
           });
           loadMethod = `senha: "${password}"`;
-          console.log(`✅ PDF carregado com senha: "${password}"`);
           break;
         } catch (e) {
           // Continuar tentando
@@ -332,9 +249,8 @@ async function decryptPdfWithPdfLib(pdfInput) {
             parseSpeed: 150 // Mais lento, mas mais robusto
           });
           loadMethod = 'modo de recuperação avançado';
-          console.log('✅ PDF carregado em modo de recuperação');
         } catch (thirdError) {
-          console.error('❌ Falha em todas as tentativas de carregar o PDF:', thirdError.message);
+          console.error('Falha em todas as tentativas de carregar o PDF:', thirdError);
           if (!pdfDoc) {
             throw thirdError;
           }
@@ -342,11 +258,7 @@ async function decryptPdfWithPdfLib(pdfInput) {
       }
     }
     
-    if (!pdfDoc) {
-      throw new Error('Não foi possível carregar o PDF com nenhuma estratégia');
-    }
-    
-    console.log(`✅ PDF carregado com sucesso usando: ${loadMethod}`);
+    console.log(`PDF carregado com sucesso usando ${loadMethod}`);
     
     // Criar um novo documento para copiar o conteúdo
     const newPdfDoc = await PDFDocument.create();
@@ -356,8 +268,6 @@ async function decryptPdfWithPdfLib(pdfInput) {
     let pagesAdded = 0;
     let errorPages = 0;
     
-    console.log(`📄 Copiando ${pageCount} páginas...`);
-    
     for (let i = 0; i < pageCount; i++) {
       try {
         // Copiar página por página
@@ -365,7 +275,7 @@ async function decryptPdfWithPdfLib(pdfInput) {
         newPdfDoc.addPage(copiedPage);
         pagesAdded++;
       } catch (pageError) {
-        console.warn(`⚠️ Não foi possível copiar a página ${i+1}: ${pageError.message}`);
+        console.warn(`Não foi possível copiar a página ${i+1}:`, pageError.message);
         errorPages++;
         
         // Adicionar uma página em branco para manter a estrutura
@@ -378,7 +288,7 @@ async function decryptPdfWithPdfLib(pdfInput) {
               size: 12
             });
           } catch (blankError) {
-            console.error('❌ Erro ao adicionar página em branco:', blankError.message);
+            console.error('Erro ao adicionar página em branco:', blankError);
           }
         }
       }
@@ -393,15 +303,11 @@ async function decryptPdfWithPdfLib(pdfInput) {
       };
     }
     
-    console.log(`✅ ${pagesAdded} páginas copiadas com sucesso (${errorPages} erros)`);
-    
     // Salvar o novo documento sem criptografia
     const newPdfBytes = await newPdfDoc.save({
       useObjectStreams: false // Melhor compatibilidade
     });
     fs.writeFileSync(outputPath, newPdfBytes);
-    
-    console.log(`💾 PDF desprotegido salvo: ${outputPath}`);
     
     return {
       success: true,
@@ -414,111 +320,73 @@ async function decryptPdfWithPdfLib(pdfInput) {
       protectionType: protectionInfo.description,
       isLaboratoryReport: protectionInfo.isLaboratoryReport
     };
-    
   } catch (error) {
-    console.error('❌ Erro ao decriptar PDF com pdf-lib:', error.message);
+    console.error('Erro ao decriptar PDF com pdf-lib:', error);
+    
+    // Limpar arquivo de saída se foi criado
+    if (fs.existsSync(outputPath)) {
+      fs.unlinkSync(outputPath);
+    }
     
     return {
       success: false,
       message: 'Falha ao decriptar o PDF',
       error: error.message
     };
-    
-  } finally {
-    // Limpar apenas arquivos temporários criados por esta função
-    // (não limpar o arquivo de saída que será usado depois)
-    tempFiles.forEach(tempFile => {
-      try {
-        if (fs.existsSync(tempFile) && 
-            (tempFile.includes('temp_input_') || tempFile === inputPath) &&
-            tempFile !== outputPath) {
-          fs.unlinkSync(tempFile);
-          console.log(`🗑️ Arquivo temporário removido: ${tempFile}`);
-        }
-      } catch (cleanupError) {
-        console.error(`❌ Erro ao limpar ${tempFile}: ${cleanupError.message}`);
-      }
-    });
   }
 }
 
 /**
- * Estratégia para tentar decriptar/desproteger um PDF - VERSÃO CORRIGIDA
- * @param {string|Buffer} pdfInput - Caminho do arquivo PDF ou Buffer
+ * Estratégia para tentar decriptar/desproteger um PDF
+ * Usa apenas métodos compatíveis com Vercel
+ * @param {string} filePath - Caminho do arquivo PDF original
  * @returns {Promise<object>} - Resultado da tentativa de decriptação
  */
-async function attemptPdfDecryption(pdfInput) {
-  try {
-    console.log('🔓 Iniciando tentativa de decriptação...');
-    
-    // Primeiro, verificar se o PDF está realmente criptografado
-    const isEncrypted = await isPdfEncrypted(pdfInput);
-    
-    if (!isEncrypted) {
-      console.log('✅ PDF não está criptografado');
-      
-      // Se não está criptografado mas pdfInput é Buffer, criar arquivo temporário
-      if (Buffer.isBuffer(pdfInput)) {
-        const tempPath = path.join(os.tmpdir(), `temp_unencrypted_${Date.now()}_${Math.random().toString(36).substr(2, 9)}.pdf`);
-        fs.writeFileSync(tempPath, pdfInput);
-        console.log('💾 Buffer convertido para arquivo temporário');
-        return {
-          success: true,
-          message: 'PDF não está criptografado',
-          decryptedPath: tempPath
-        };
-      }
-      
-      return {
-        success: true,
-        message: 'PDF não está criptografado',
-        decryptedPath: pdfInput
-      };
-    }
-    
-    // Analisar o tipo de proteção
-    const protectionInfo = await detectProtectionType(pdfInput);
-    console.log(`🔒 PDF protegido: ${protectionInfo.description}, Nível: ${protectionInfo.protectionLevel}`);
-    
-    if (protectionInfo.isLaboratoryReport) {
-      console.log('🧪 Detectado padrão de laudo laboratorial');
-    }
-    
-    // Tentar desencriptar com pdf-lib (compatível com Vercel)
-    console.log('🔧 Tentando remover proteção com pdf-lib...');
-    const pdfLibResult = await decryptPdfWithPdfLib(pdfInput);
-    
-    if (pdfLibResult.success) {
-      console.log(`✅ Proteção removida usando: ${pdfLibResult.method}`);
-      
-      // Adicionar informações sobre o tipo de proteção ao resultado
-      return {
-        ...pdfLibResult,
-        protectionType: protectionInfo.description,
-        permissionValue: protectionInfo.permissionValue,
-        isLaboratoryReport: protectionInfo.isLaboratoryReport
-      };
-    }
-    
-    // Se chegamos aqui, a tentativa falhou
-    console.log('❌ Falha na remoção de proteção');
+async function attemptPdfDecryption(filePath) {
+  // Primeiro, verificar se o PDF está realmente criptografado
+  const isEncrypted = await isPdfEncrypted(filePath);
+  
+  if (!isEncrypted) {
     return {
-      success: false,
-      message: `Não foi possível remover a proteção do PDF (${protectionInfo.description})`,
-      error: pdfLibResult.error || 'Método falhou',
+      success: true,
+      message: 'PDF não está criptografado',
+      decryptedPath: filePath
+    };
+  }
+  
+  // Analisar o tipo de proteção
+  const protectionInfo = await detectProtectionType(filePath);
+  console.log(`PDF está protegido. Tipo: ${protectionInfo.description}, Nível: ${protectionInfo.protectionLevel}`);
+  
+  if (protectionInfo.isLaboratoryReport) {
+    console.log('Detectado padrão típico de laudo laboratorial (permite impressão, bloqueia cópias)');
+  }
+  
+  // Tentar desencriptar com pdf-lib (compatível com Vercel)
+  console.log('Tentando remover proteção com pdf-lib...');
+  const pdfLibResult = await decryptPdfWithPdfLib(filePath);
+  
+  if (pdfLibResult.success) {
+    console.log(`Proteção removida com sucesso usando ${pdfLibResult.method}`);
+    
+    // Adicionar informações sobre o tipo de proteção ao resultado
+    return {
+      ...pdfLibResult,
       protectionType: protectionInfo.description,
       permissionValue: protectionInfo.permissionValue,
       isLaboratoryReport: protectionInfo.isLaboratoryReport
     };
-    
-  } catch (error) {
-    console.error('❌ Erro na tentativa de decriptação:', error.message);
-    return {
-      success: false,
-      message: 'Erro durante a decriptação',
-      error: error.message
-    };
   }
+  
+  // Se chegamos aqui, a tentativa falhou
+  return {
+    success: false,
+    message: `Não foi possível remover a proteção do PDF (${protectionInfo.description})`,
+    error: 'Método falhou',
+    protectionType: protectionInfo.description,
+    permissionValue: protectionInfo.permissionValue,
+    isLaboratoryReport: protectionInfo.isLaboratoryReport
+  };
 }
 
 module.exports = {
