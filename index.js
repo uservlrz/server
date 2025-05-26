@@ -260,7 +260,7 @@ async function generateSummaries(pages, patientName) {
 
 1. EXTRAIA APENAS:
    - Nome do exame (exatamente como aparece no documento)
-   - Valor numérico do resultado (sem unidades de medida)
+   - Valor numérico do resultado (sem unidades de medida). Geralmente vem depois da palavra "Resultado" 
    - Intervalo de referência (somente os valores numéricos mínimo e máximo)
 
 2. FORMATO EXATO para cada linha:
