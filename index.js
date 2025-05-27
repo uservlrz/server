@@ -280,7 +280,7 @@ async function generateSummaries(pages, patientName) {
    - Quando o valor de referência é "até X" ou "menor que X", use o formato "0 - X"
    - Para intervalos de referência baseados em idade/sexo, escolha o mais apropriado ou use o intervalo geral
 
-5. EXAMES PRIORITÁRIOS (sempre extrair se presentes):
+5. EXAMES PRIORITÁRIOS (SEMPRE extrair se presentes):
    - Perfil Lipídico: Colesterol Total, HDL, LDL, VLDL, Triglicerídeos
    - Hormônios: Testosterona Total, SHBG, Testosterona Livre, Testosterona Biodisponível, DHT, Cortisol
    - Metabólicos: Glicose, Insulina, Hemoglobina Glicada, HOMA-IR
