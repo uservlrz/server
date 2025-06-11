@@ -13,7 +13,7 @@ function isBlobConfigured() {
  * Salva um PDF no Vercel Blob com verificação de ambiente
  * @param {Buffer} pdfBuffer - Buffer do arquivo PDF
  * @param {string} filename - Nome do arquivo
- * @returns {Promise<Object>} - Objeto com URL e informações do blob
+ * @returns {Promise<Object>} - Objeto com URL e informações do blob  
  */
 async function savePdfToBlob(pdfBuffer, filename) {
   try {
